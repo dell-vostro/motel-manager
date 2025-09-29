@@ -1,8 +1,10 @@
-version: "3.8"
 services:
   web:
-    build: .
-    image: tro-tot-webapp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # image đặt tên nội bộ nếu thích (không pull từ registry)
+    image: motel-manager:local
     ports:
-      - "9090:80"
+      - "80:80"
     restart: unless-stopped
