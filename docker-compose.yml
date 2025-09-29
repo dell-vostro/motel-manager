@@ -6,5 +6,5 @@ services:
     # image đặt tên nội bộ nếu thích (không pull từ registry)
     image: motel-manager:local
     ports:
-      - "80:80"
+      - 9090:80
     restart: unless-stopped
