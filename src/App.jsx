@@ -271,7 +271,7 @@ function PropertyDetailPage() {
     .filter((x) => x.inv.date && new Date(x.inv.date).getMonth() === 8)
     .reduce((s, x) => s + x.inv.total, 0);
 
-  // fix: setSearchParams with object for compatibility
+  // Compatibility: setSearchParams with object
   const setTab = (t) => setSearchParams({ tab: t }, { replace: true });
 
   if (!property) {
@@ -748,7 +748,7 @@ function TenantsView() {
   const rows = contracts.map((c) => {
     const t = tenants.find((x) => x.id === c.tenantId);
     const r = rooms.find((x) => x.id === c.roomId);
-    const p = propertiesSeed.find((x) => x.id === r.propertyId);
+    const p = propertiesSeed.find((x) => x.id === r?.propertyId);
     return { tenant: t, room: r, property: p, contract: c };
   });
   return (
@@ -892,7 +892,7 @@ function ResidenceView() {
             {contracts.map((c) => {
               const t = tenants.find((x) => x.id === c.tenantId);
               const r = rooms.find((x) => x.id === c.roomId);
-              const p = propertiesSeed.find((x) => x.id === r.propertyId);
+              const p = propertiesSeed.find((x) => x.id === r?.propertyId);
               const badge = c.residenceStatus === "Đã đăng ký" ? <Badge color="green">Đã đăng ký</Badge> : <Badge color="red">Chưa đăng ký</Badge>;
               const action = c.residenceStatus === "Đã đăng ký" ? (
                 <a className="font-medium text-red-600 hover:underline" href="#">Xóa đăng ký</a>
@@ -916,6 +916,16 @@ function ResidenceView() {
           </tbody>
         </table>
       </div>
+    </Card>
+  );
+}
+
+// ===== Settings (placeholder) =====
+function SettingsView() {
+  return (
+    <Card className="p-6">
+      <h3 className="text-xl font-semibold mb-4">Cài đặt</h3>
+      <p className="text-sm text-gray-600">Trang cài đặt đang được phát triển.</p>
     </Card>
   );
 }
@@ -995,15 +1005,6 @@ function Shell() {
         </div>
       </div>
     </div>
-  );
-}
-
-function SettingsView() {
-  return (
-    <Card className="p-6">
-      <h3 className="text-xl font-semibold mb-4">Cài đặt</h3>
-      <p className="text-sm text-gray-600">Trang cài đặt đang được phát triển.</p>
-    </Card>
   );
 }
 
