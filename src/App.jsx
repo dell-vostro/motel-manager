@@ -998,6 +998,15 @@ function Shell() {
   );
 }
 
+function SettingsView() {
+  return (
+    <Card className="p-6">
+      <h3 className="text-xl font-semibold mb-4">Cài đặt</h3>
+      <p className="text-sm text-gray-600">Trang cài đặt đang được phát triển.</p>
+    </Card>
+  );
+}
+
 // ===== App (HashRouter wrapper) =====
 export default function MotelConsoleApp() {
   return (
