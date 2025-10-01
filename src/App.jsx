@@ -371,6 +371,19 @@ const contracts = [
     residenceStatus: "Chưa đăng ký",
   },
 ];
+
+const contractPartiesSeed = [
+  { id: "CP-1", contractId: 1, personId: 1, role: "PRIMARY", joinDate: "2025-07-01", status: "ACTIVE" },
+  { id: "CP-2", contractId: 2, personId: 2, role: "PRIMARY", joinDate: "2024-10-29", status: "ACTIVE" },
+  { id: "CP-3", contractId: 3, personId: 3, role: "PRIMARY", joinDate: "2025-09-15", status: "ACTIVE" },
+  { id: "CP-4", contractId: 4, personId: 4, role: "PRIMARY", joinDate: "2025-03-28", status: "ACTIVE" },
+  { id: "CP-5", contractId: 5, personId: 5, role: "PRIMARY", joinDate: "2025-01-10", status: "ACTIVE" },
+  { id: "CP-6", contractId: 6, personId: 6, role: "PRIMARY", joinDate: "2025-08-15", status: "PENDING" },
+  { id: "CP-7", contractId: 7, personId: 7, role: "PRIMARY", joinDate: "2024-11-20", status: "LEFT", endDate: "2025-06-30" },
+  { id: "CP-8", contractId: 8, personId: 8, role: "PRIMARY", joinDate: "2025-05-01", status: "ACTIVE" },
+  { id: "CP-9", contractId: 9, personId: 9, role: "PRIMARY", joinDate: "2025-04-12", status: "ACTIVE" },
+  { id: "CP-10", contractId: 10, personId: 10, role: "PRIMARY", joinDate: "2025-02-22", status: "PENDING" },
+];
 const invoices = [
   { id: 1, roomId: 101, total: 3950000, status: "Đã thanh toán", date: "2025-09-28" },
   { id: 2, roomId: 102, total: 3925000, status: "Đã thanh toán", date: "2025-09-29" },
@@ -1491,17 +1504,531 @@ function PropertyDetailInline({ pid }) {
 }
 
 function TenantsView() {
-  const rows = contracts.map((c) => {
-    const t = tenants.find((x) => x.id === c.tenantId);
-    const r = rooms.find((x) => x.id === c.roomId);
-    const p = propertiesSeed.find((x) => x.id === r?.propertyId);
-    return { tenant: t, room: r, property: p, contract: c };
+  const { appendLog } = useActionLog();
+  const [tenantItems, setTenantItems] = useState(() => tenants.map((t) => ({ ...t })));
+  const [contractParties, setContractParties] = useState(() => contractPartiesSeed.map((p) => ({ ...p })));
+  const [editMode, setEditMode] = useState(false);
+
+  const getPropertyIdFromContract = (contract) => {
+    const room = rooms.find((r) => r.id === contract.roomId);
+    return room ? String(room.propertyId) : "";
+  };
+
+  const makeEmptyTenantForm = () => {
+    const nextId = tenantItems.length ? Math.max(...tenantItems.map((t) => t.id)) + 1 : 1;
+    const firstContract = contracts[0] || null;
+    const firstPropertyId = firstContract ? getPropertyIdFromContract(firstContract) : "";
+    const firstContractId = firstContract ? String(firstContract.id) : "";
+    return {
+      id: nextId,
+      propertyId: firstPropertyId,
+      contractId: firstContractId,
+      role: "PRIMARY",
+      name: "",
+      gender: "",
+      dob: "",
+      idCard: "",
+      idCardIssueDate: "",
+      idCardIssuePlace: "",
+      phone: "",
+      zalo: "",
+      job: "",
+      notes: "",
+    };
+  };
+
+  const [addModal, setAddModal] = useState(() => ({ open: false, data: makeEmptyTenantForm(), files: [] }));
+  const [profile, setProfile] = useState({ open: false, tenant: null, room: null, property: null, contract: null, party: null, timeline: [], editing: false });
+  const [profileForm, setProfileForm] = useState(null);
+  const [propertyFilter, setPropertyFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const statusLabels = {
+    DRAFT: "Nháp",
+    ACTIVE: "Đang hiệu lực",
+    ENDING: "Sắp kết thúc",
+    TERMINATED: "Đã chấm dứt",
+  };
+
+  const propertyOptions = useMemo(
+    () => [{ value: "all", label: "Tất cả nhà trọ" }, ...propertiesSeed.map((p) => ({ value: String(p.id), label: p.name }))],
+    []
+  );
+
+  const statusOptions = [
+    { value: "all", label: "Tất cả trạng thái" },
+    { value: "party:ACTIVE", label: "Đang cư trú" },
+    { value: "party:PENDING", label: "Chờ kích hoạt" },
+    { value: "party:LEFT", label: "Đã rời" },
+    { value: "contract:ACTIVE", label: statusLabels.ACTIVE },
+    { value: "contract:DRAFT", label: statusLabels.DRAFT },
+    { value: "contract:ENDING", label: statusLabels.ENDING },
+    { value: "contract:TERMINATED", label: statusLabels.TERMINATED },
+    { value: "no-contract", label: "Chưa có hợp đồng" },
+  ];
+
+  const partyStatusMeta = {
+    PENDING: { color: "yellow", label: "Chờ kích hoạt" },
+    ACTIVE: { color: "green", label: "Đang cư trú" },
+    LEFT: { color: "gray", label: "Đã rời" },
+  };
+
+  const partyStatusOptions = [
+    { value: "PENDING", label: partyStatusMeta.PENDING.label },
+    { value: "ACTIVE", label: partyStatusMeta.ACTIVE.label },
+    { value: "LEFT", label: partyStatusMeta.LEFT.label },
+  ];
+
+  const residenceStatusMeta = {
+    "Đã đăng ký": { color: "green", label: "Đã đăng ký" },
+    "Chưa đăng ký": { color: "yellow", label: "Chưa đăng ký" },
+    "Đang cập nhật": { color: "blue", label: "Đang cập nhật" },
+  };
+
+  const rows = useMemo(() => {
+    return tenantItems.map((tenant) => {
+      const parties = contractParties.filter((party) => party.personId === tenant.id);
+      const activeParty = parties.find((party) => party.status === "ACTIVE") || null;
+      const sortedParties = parties
+        .slice()
+        .sort((a, b) => new Date(b.joinDate || 0).getTime() - new Date(a.joinDate || 0).getTime());
+      const currentParty = activeParty || sortedParties[0] || null;
+      const contract = currentParty ? contracts.find((c) => c.id === currentParty.contractId) || null : null;
+      const room = contract ? rooms.find((r) => r.id === contract.roomId) || null : null;
+      const property = room ? propertiesSeed.find((p) => p.id === room.propertyId) || null : null;
+      return { tenant, party: currentParty, parties, contract, room, property };
+    });
+  }, [tenantItems, contractParties]);
+
+  const filteredRows = useMemo(() => {
+    const keyword = searchTerm.trim().toLowerCase();
+
+    return rows.filter((row) => {
+      if (propertyFilter !== "all") {
+        if (!row.property || String(row.property.id) !== propertyFilter) return false;
+      }
+
+      if (statusFilter !== "all") {
+        if (statusFilter.startsWith("party:")) {
+          const target = statusFilter.split(":")[1];
+          if (!row.party || row.party.status !== target) return false;
+        } else if (statusFilter.startsWith("contract:")) {
+          const target = statusFilter.split(":")[1];
+          if (!row.contract || row.contract.status !== target) return false;
+        } else if (statusFilter === "no-contract") {
+          if (row.party && row.contract) return false;
+        }
+      }
+
+      if (!keyword) return true;
+
+      const haystack = [
+        row.tenant?.name,
+        row.tenant?.phone,
+        row.tenant?.idCard,
+        row.room?.name,
+        row.property?.name,
+        row.party?.role,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      return haystack.includes(keyword);
+    });
+  }, [rows, propertyFilter, statusFilter, searchTerm]);
+
+  const todayIso = () => new Date().toISOString().slice(0, 10);
+
+  const composePartyMeta = (party, contract) => {
+    if (!party) return null;
+    const meta = partyStatusMeta[party.status] || partyStatusMeta.PENDING;
+    const roleLabel = party.role === "PRIMARY" ? "Người đứng tên" : "Đồng cư";
+    const contractLabel = contract ? contract.code : "—";
+    return { ...meta, roleLabel, contractLabel };
+  };
+
+  const changePartyStatus = ({ party, tenant, contract, room, property, nextStatus, silent = false, extraPatch = {} }) => {
+    if (!party || !nextStatus) return;
+    const now = todayIso();
+    const buildUpdatedParty = (current) => {
+      let updated = { ...current, status: nextStatus };
+      if (nextStatus === "ACTIVE") {
+        updated = { ...updated, joinDate: current.joinDate || now, endDate: null, activatedAt: now };
+      } else if (nextStatus === "LEFT") {
+        updated = { ...updated, endDate: current.endDate || now };
+      } else if (nextStatus === "PENDING") {
+        updated = { ...updated, endDate: null };
+      }
+      updated = { ...updated, ...extraPatch };
+      return updated;
+    };
+
+    setContractParties((prev) => prev.map((item) => (item.id === party.id ? buildUpdatedParty(item) : item)));
+
+    setProfile((prev) => {
+      if (!prev.open || !prev.party || prev.party.id !== party.id) return prev;
+      const updatedParty = buildUpdatedParty(prev.party);
+      return {
+        ...prev,
+        contract: contract || prev.contract,
+        room: room || prev.room,
+        property: property || prev.property,
+        party: updatedParty,
+        timeline: prev.timeline.map((entry) => (entry.id === party.id ? buildUpdatedParty(entry) : entry)),
+      };
+    });
+
+    if (!silent) {
+      const statusMeta = partyStatusMeta[nextStatus] || partyStatusMeta.PENDING;
+      appendLog({
+        type: nextStatus === "LEFT" ? "tenant:left" : nextStatus === "ACTIVE" ? "tenant:activate" : "tenant:status",
+        message:
+          nextStatus === "LEFT"
+            ? `Đánh dấu ${tenant?.name || "khách thuê"} rời phòng`
+            : nextStatus === "ACTIVE"
+            ? `Kích hoạt cư trú cho ${tenant?.name || "khách thuê"}`
+            : `Cập nhật trạng thái cư trú của ${tenant?.name || "khách thuê"}`,
+        meta: {
+          "Trạng thái": statusMeta.label,
+          "Hợp đồng": contract?.code || "—",
+          "Phòng": room?.name || "—",
+          "Nhà trọ": property?.name || "—",
+        },
+      });
+    }
+  };
+
+  const activateParty = (row) => {
+    if (!row.party) return;
+    changePartyStatus({
+      party: row.party,
+      tenant: row.tenant,
+      contract: row.contract,
+      room: row.room,
+      property: row.property,
+      nextStatus: "ACTIVE",
+    });
+  };
+
+  const createContractParty = ({ contractId, personId, role = "CO", status = "PENDING", joinDate }) => ({
+    id: `CP-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 6)}`,
+    contractId,
+    personId,
+    role,
+    status,
+    joinDate: joinDate || todayIso(),
   });
+
+  const toggleEditMode = () => setEditMode((prev) => !prev);
+
+  const handleDeleteTenant = (row) => {
+    if (!row.tenant) return;
+    if (profile.tenant?.id === row.tenant.id) {
+      closeProfile();
+    }
+    setTenantItems((prev) => prev.filter((item) => item.id !== row.tenant.id));
+    setContractParties((prev) => prev.filter((party) => party.personId !== row.tenant.id));
+    appendLog({
+      type: "tenant:delete",
+      message: `Xóa khách thuê ${row.tenant.name} khỏi danh sách`,
+      meta: {
+        "Hợp đồng": row.contract?.code || "—",
+        "Phòng": row.room?.name || "—",
+      },
+    });
+  };
+
+  const openAddTenant = () => setAddModal({ open: true, data: makeEmptyTenantForm(), files: [] });
+  const closeAddTenant = () => setAddModal({ open: false, data: makeEmptyTenantForm(), files: [] });
+
+  const updateAddForm = (patch) => {
+    setAddModal((prev) => {
+      const nextData = { ...prev.data, ...patch };
+      if (patch.propertyId !== undefined) {
+        const propertyContracts = contracts.filter((c) => getPropertyIdFromContract(c) === patch.propertyId);
+        nextData.contractId = propertyContracts[0] ? String(propertyContracts[0].id) : "";
+      }
+      if (patch.contractId !== undefined && patch.contractId) {
+        nextData.contractId = patch.contractId;
+      }
+      if (patch.phone !== undefined && (!prev.data.zalo || prev.data.zalo === prev.data.phone)) {
+        nextData.zalo = patch.phone;
+      }
+      return { ...prev, data: nextData };
+    });
+  };
+
+  const handleUploadFiles = (event) => {
+    const fileList = event.target.files;
+    if (!fileList) return;
+    const files = Array.from(fileList);
+    setAddModal((prev) => ({ ...prev, files: [...prev.files, ...files] }));
+    event.target.value = "";
+  };
+
+  const removeUploadFile = (name) => {
+    setAddModal((prev) => ({ ...prev, files: prev.files.filter((f) => f.name !== name) }));
+  };
+
+  const submitAddTenant = () => {
+    const form = addModal.data;
+    if (!form.name.trim()) return;
+    if (!form.contractId) return;
+    const contract = contracts.find((c) => String(c.id) === form.contractId);
+    if (!contract) return;
+    const newTenant = {
+      id: form.id,
+      name: form.name.trim(),
+      gender: form.gender,
+      phone: form.phone.trim(),
+      zalo: form.zalo.trim(),
+      dob: form.dob || null,
+      idCard: form.idCard.trim(),
+      idCardIssueDate: form.idCardIssueDate || null,
+      idCardIssuePlace: form.idCardIssuePlace.trim(),
+      job: form.job.trim(),
+      notes: form.notes.trim(),
+      files: addModal.files.map((file) => file.name),
+    };
+    setTenantItems((prev) => [...prev, newTenant]);
+    setContractParties((prev) => [
+      ...prev,
+      createContractParty({
+        contractId: contract.id,
+        personId: newTenant.id,
+        role: form.role || "PRIMARY",
+        status: "PENDING",
+        joinDate: contract.startDate,
+      }),
+    ]);
+    const room = rooms.find((r) => r.id === contract.roomId);
+    const property = room ? propertiesSeed.find((p) => p.id === room.propertyId) : null;
+    appendLog({
+      type: "tenant:create",
+      message: `Thêm khách thuê ${newTenant.name}`,
+      meta: {
+        "Số điện thoại": newTenant.phone || "—",
+        "CCCD": newTenant.idCard || "—",
+        "Hợp đồng": contract.code,
+        "Phòng": room?.name || "—",
+        "Nhà trọ": property?.name || "—",
+      },
+    });
+    closeAddTenant();
+  };
+
+  const openProfile = ({ tenant, room, property, contract, party, parties }) => {
+    const sortedTimeline = parties
+      ? parties
+          .slice()
+          .sort((a, b) => new Date(a.joinDate || 0).getTime() - new Date(b.joinDate || 0).getTime())
+      : [];
+    setProfile({ open: true, tenant, room, property, contract, party, timeline: sortedTimeline, editing: false });
+    setProfileForm(null);
+    if (tenant) {
+      appendLog({
+        type: "tenant:view",
+        message: `Xem hồ sơ khách ${tenant.name}`,
+        meta: {
+          "Phòng": room?.name || "—",
+          "Nhà trọ": property?.name || "—",
+        },
+      });
+    }
+  };
+
+  const closeProfile = () => {
+    setProfile({ open: false, tenant: null, room: null, property: null, contract: null, party: null, timeline: [], editing: false });
+    setProfileForm(null);
+  };
+
+  const startProfileEdit = () => {
+    if (!profile.tenant) return;
+    setProfileForm({
+      name: profile.tenant.name || "",
+      gender: profile.tenant.gender || "",
+      dob: profile.tenant.dob || "",
+      idCard: profile.tenant.idCard || "",
+      idCardIssueDate: profile.tenant.idCardIssueDate || "",
+      idCardIssuePlace: profile.tenant.idCardIssuePlace || "",
+      phone: profile.tenant.phone || "",
+      zalo: profile.tenant.zalo || profile.tenant.phone || "",
+      job: profile.tenant.job || "",
+      notes: profile.tenant.notes || "",
+      role: profile.party?.role || "PRIMARY",
+      status: profile.party?.status || "PENDING",
+    });
+    setProfile((prev) => ({ ...prev, editing: true }));
+  };
+
+  const cancelProfileEdit = () => {
+    setProfile((prev) => ({ ...prev, editing: false }));
+    setProfileForm(null);
+  };
+
+  const updateProfileForm = (patch) => {
+    setProfileForm((prev) => (prev ? { ...prev, ...patch } : { ...patch }));
+  };
+
+  const saveProfileEdit = () => {
+    if (!profile.tenant || !profileForm) return;
+    const roleValue = profileForm.role || "PRIMARY";
+    const statusValue = profileForm.status || profile.party?.status || "PENDING";
+    const sanitized = {
+      name: profileForm.name.trim(),
+      gender: profileForm.gender,
+      dob: profileForm.dob || null,
+      idCard: profileForm.idCard.trim(),
+      idCardIssueDate: profileForm.idCardIssueDate || null,
+      idCardIssuePlace: profileForm.idCardIssuePlace.trim(),
+      phone: profileForm.phone.trim(),
+      zalo: profileForm.zalo.trim() || profileForm.phone.trim(),
+      job: profileForm.job.trim(),
+      notes: profileForm.notes.trim(),
+    };
+
+    setTenantItems((prev) =>
+      prev.map((tenant) =>
+        tenant.id === profile.tenant.id
+          ? {
+              ...tenant,
+              ...sanitized,
+            }
+          : tenant
+      )
+    );
+
+    if (profile.party) {
+      changePartyStatus({
+        party: profile.party,
+        tenant: profile.tenant,
+        contract: profile.contract,
+        room: profile.room,
+        property: profile.property,
+        nextStatus: statusValue,
+        silent: statusValue === profile.party.status,
+        extraPatch: { role: roleValue },
+      });
+    }
+
+    const updatedTenant = {
+      ...profile.tenant,
+      ...sanitized,
+    };
+
+    setProfile((prev) => ({
+      ...prev,
+      tenant: updatedTenant,
+      editing: false,
+    }));
+
+    appendLog({
+      type: "tenant:update",
+      message: `Cập nhật hồ sơ ${sanitized.name || profile.tenant.name}`,
+      meta: {
+        "Số điện thoại": sanitized.phone || "—",
+        "Hợp đồng": profile.contract?.code || "—",
+        "Phòng": profile.room?.name || "—",
+        "Trạng thái cư trú": profile.party ? (partyStatusMeta[statusValue]?.label || statusValue) : "—",
+      },
+    });
+
+    setProfileForm(null);
+  };
+
+  const handleProfileStatusChange = (nextStatus) => {
+    if (!nextStatus || !profile.party) return;
+    if (profile.party.status === nextStatus) return;
+    changePartyStatus({
+      party: profile.party,
+      tenant: profile.tenant,
+      contract: profile.contract,
+      room: profile.room,
+      property: profile.property,
+      nextStatus,
+    });
+  };
+
+  const tenantAge = (dob) => {
+    if (!dob) return "—";
+    const birthday = new Date(dob);
+    if (Number.isNaN(birthday.getTime())) return "—";
+    const diff = Date.now() - birthday.getTime();
+    return Math.abs(new Date(diff).getUTCFullYear() - 1970);
+  };
+
+  const profileTenantId = profile.tenant ? profile.tenant.id : null;
+
+  useEffect(() => {
+    if (!profile.open || !profileTenantId) return;
+    const updatedRow = rows.find((row) => row.tenant.id === profileTenantId);
+    if (!updatedRow) return;
+    const sortedTimeline = updatedRow.parties
+      .slice()
+      .sort((a, b) => new Date(a.joinDate || 0).getTime() - new Date(b.joinDate || 0).getTime());
+    setProfile((prev) => ({
+      ...prev,
+      room: updatedRow.room,
+      property: updatedRow.property,
+      contract: updatedRow.contract,
+      party: updatedRow.party,
+      timeline: sortedTimeline,
+    }));
+  }, [rows, profile.open, profileTenantId]);
+
   return (
     <Card className="p-6">
       <div className="flex justify-between items-center mb-4">
-        <h3 className="text-xl font-semibold">Danh sách khách thuê</h3>
-        <Button><Plus className="h-5 w-5 mr-2" /> Thêm khách thuê</Button>
+        <div>
+          <h3 className="text-xl font-semibold">Danh sách khách thuê</h3>
+          <p className="text-xs text-gray-500">Quản lý thông tin cư dân hiện tại và khách mới.</p>
+        </div>
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            onClick={toggleEditMode}
+            className={editMode ? "border-indigo-500 text-indigo-600" : ""}
+          >
+            {editMode ? "Hoàn tất" : "Chỉnh sửa"}
+          </Button>
+          <Button onClick={openAddTenant}><Plus className="h-5 w-5 mr-2" /> Thêm khách thuê</Button>
+        </div>
+      </div>
+      <div className="grid gap-4 md:grid-cols-3 mb-4">
+        <div>
+          <Label>Nhà trọ</Label>
+          <select
+            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+            value={propertyFilter}
+            onChange={(event) => setPropertyFilter(event.target.value)}
+          >
+            {propertyOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <Label>Trạng thái</Label>
+          <select
+            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+            value={statusFilter}
+            onChange={(event) => setStatusFilter(event.target.value)}
+          >
+            {statusOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <Label>Tìm kiếm</Label>
+          <Input
+            placeholder="Nhập tên, SĐT, phòng hoặc CCCD"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+          />
+        </div>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm text-left text-gray-600">
@@ -1509,28 +2036,499 @@ function TenantsView() {
             <tr>
               <th className="px-6 py-3">Khách thuê</th>
               <th className="px-6 py-3">Phòng đang ở</th>
-              <th className="px-6 py-3">Ngày kết thúc HĐ</th>
+              <th className="px-6 py-3">Trạng thái cư trú</th>
+              <th className="px-6 py-3">Trạng thái tạm trú</th>
+              <th className="px-6 py-3">Ngày vào ở/Rời đi</th>
               <th className="px-6 py-3">Hành động</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map(({ tenant, room, property, contract }) => (
-              <tr key={tenant?.id || Math.random()} className="bg-white border-b hover:bg-gray-50">
+            {filteredRows.map((row) => {
+              const partyMeta = composePartyMeta(row.party, row.contract);
+              const residenceMeta = row.contract?.residenceStatus
+                ? residenceStatusMeta[row.contract.residenceStatus] || { color: "gray", label: row.contract.residenceStatus }
+                : null;
+              return (
+              <tr key={row.tenant?.id || Math.random()} className="bg-white border-b hover:bg-gray-50">
                 <td className="px-6 py-4 font-medium text-gray-900 whitespace-nowrap">
-                  {tenant?.name}
-                  <br />
-                  <span className="text-xs text-gray-500">{tenant?.phone}</span>
+                  {row.tenant?.name || "(Chưa có)"}
+                  <div className="text-xs text-gray-500">{row.tenant?.phone}</div>
                 </td>
-                <td className="px-6 py-4">{room?.name} - {property?.name}</td>
-                <td className="px-6 py-4">{fdate(contract.endDate)}</td>
                 <td className="px-6 py-4">
-                  <a className="font-medium text-indigo-600 hover:underline" href="#">Xem hồ sơ</a>
+                  {row.room ? `${row.room.name} - ${row.property?.name}` : "(Chưa xếp phòng)"}
+                </td>
+                <td className="px-6 py-4">
+                  {partyMeta ? (
+                    <div className="space-y-1">
+                      <Badge color={partyMeta.color}>{partyMeta.label}</Badge>
+                      <div className="text-xs text-gray-500">{partyMeta.roleLabel}</div>
+                      <div className="text-xs text-gray-400">HĐ: {partyMeta.contractLabel}</div>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-gray-400">Chưa liên kết hợp đồng</span>
+                  )}
+                </td>
+                <td className="px-6 py-4">
+                  {residenceMeta ? (
+                    <Link to="/residence" className="inline-flex items-center gap-2 text-xs text-indigo-600 hover:underline">
+                      <Badge color={residenceMeta.color}>{residenceMeta.label}</Badge>
+                      <ChevronRight className="h-3 w-3" />
+                      <span>Xem</span>
+                    </Link>
+                  ) : (
+                    <span className="text-xs text-gray-400">—</span>
+                  )}
+                </td>
+                <td className="px-6 py-4">
+                  {row.party
+                    ? row.party.status === "LEFT"
+                      ? row.party.endDate
+                        ? fdate(row.party.endDate)
+                        : "Đang cập nhật"
+                      : row.party.joinDate
+                        ? fdate(row.party.joinDate)
+                        : "—"
+                    : "—"}
+                </td>
+                <td className="px-6 py-4">
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="outline" onClick={() => openProfile(row)}>Xem hồ sơ</Button>
+                    {row.party?.status === "PENDING" && (
+                      <Button variant="green" onClick={() => activateParty(row)}>Kích hoạt</Button>
+                    )}
+                    {editMode && (
+                      <Button variant="danger" onClick={() => handleDeleteTenant(row)}>Xóa</Button>
+                    )}
+                  </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
+            {filteredRows.length === 0 && (
+              <tr>
+                <td colSpan={6} className="px-6 py-8 text-center text-gray-500">Không tìm thấy khách thuê phù hợp với điều kiện lọc.</td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
+
+      <Modal
+        open={addModal.open}
+        title="Thêm khách thuê mới"
+        onClose={closeAddTenant}
+        footer={
+          <>
+            <Button variant="outline" onClick={closeAddTenant}>Hủy</Button>
+            <Button onClick={submitAddTenant}>Lưu</Button>
+          </>
+        }
+      >
+        <div className="space-y-4" ref={(node) => {
+          if (node && addModal.open) {
+            const firstInput = node.querySelector("input, select");
+            firstInput?.focus();
+          }
+        }}>
+          <div>
+            <Label>Chọn nhà trọ</Label>
+            <select
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+              value={addModal.data.propertyId}
+              onChange={(e) => updateAddForm({ propertyId: e.target.value })}
+            >
+              <option value="">— Chọn nhà trọ —</option>
+              {propertiesSeed.map((property) => (
+                <option key={property.id} value={property.id}>{property.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <Label>Liên kết hợp đồng</Label>
+            <select
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+              value={addModal.data.contractId}
+              onChange={(e) => updateAddForm({ contractId: e.target.value })}
+            >
+              <option value="">— Chọn hợp đồng —</option>
+              {contracts
+                .filter((contract) => !addModal.data.propertyId || getPropertyIdFromContract(contract) === addModal.data.propertyId)
+                .map((contract) => {
+                const room = rooms.find((r) => r.id === contract.roomId);
+                const property = room ? propertiesSeed.find((p) => p.id === room.propertyId) : null;
+                const label = `${contract.code} · ${room?.name || "(Phòng?)"} · ${property?.name || "—"}`;
+                return (
+                  <option key={contract.id} value={contract.id}>{label}</option>
+                );
+              })}
+            </select>
+            <p className="text-xs text-gray-500 mt-1">Chỉ những hợp đồng đã tạo mới có thể thêm khách thuê.</p>
+          </div>
+          <div>
+            <Label>Vai trò trong hợp đồng</Label>
+            <select
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+              value={addModal.data.role}
+              onChange={(e) => updateAddForm({ role: e.target.value })}
+            >
+              <option value="PRIMARY">Người đứng tên hợp đồng</option>
+              <option value="CO">Người ở cùng</option>
+            </select>
+          </div>
+          <div>
+            <Label>Họ tên</Label>
+            <Input value={addModal.data.name} onChange={(e) => updateAddForm({ name: e.target.value })} placeholder="Nguyễn Văn A" />
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <Label>Giới tính</Label>
+              <select
+                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                value={addModal.data.gender}
+                onChange={(e) => updateAddForm({ gender: e.target.value })}
+              >
+                <option value="">—</option>
+                <option value="Nam">Nam</option>
+                <option value="Nữ">Nữ</option>
+                <option value="Khác">Khác</option>
+              </select>
+            </div>
+            <div>
+              <Label>Ngày sinh</Label>
+              <Input type="date" value={addModal.data.dob} onChange={(e) => updateAddForm({ dob: e.target.value })} />
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <Label>Số CCCD/CMND</Label>
+              <Input value={addModal.data.idCard} onChange={(e) => updateAddForm({ idCard: e.target.value })} placeholder="012345678901" />
+            </div>
+            <div>
+              <Label>Ngày cấp</Label>
+              <Input type="date" value={addModal.data.idCardIssueDate} onChange={(e) => updateAddForm({ idCardIssueDate: e.target.value })} />
+            </div>
+            <div>
+              <Label>Nơi cấp</Label>
+              <Input value={addModal.data.idCardIssuePlace} onChange={(e) => updateAddForm({ idCardIssuePlace: e.target.value })} placeholder="Công an ..." />
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <Label>Số điện thoại</Label>
+              <Input value={addModal.data.phone} onChange={(e) => updateAddForm({ phone: e.target.value })} placeholder="0901234567" />
+            </div>
+            <div>
+              <Label>Số Zalo</Label>
+              <Input value={addModal.data.zalo} onChange={(e) => updateAddForm({ zalo: e.target.value })} placeholder="Tự động điền theo SDT" />
+              <p className="text-xs text-gray-500 mt-1">Nếu để trống, hệ thống sẽ dùng số điện thoại làm số Zalo.</p>
+            </div>
+          </div>
+          <div>
+            <Label>Nghề nghiệp</Label>
+            <Input value={addModal.data.job} onChange={(e) => updateAddForm({ job: e.target.value })} placeholder="Ví dụ: Nhân viên văn phòng" />
+          </div>
+          <div>
+            <Label>Ghi chú</Label>
+            <textarea
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+              rows={3}
+              value={addModal.data.notes}
+              onChange={(e) => updateAddForm({ notes: e.target.value })}
+              placeholder="Thông tin thêm, yêu cầu đặc biệt..."
+            />
+          </div>
+          <div>
+            <Label>Tệp đính kèm</Label>
+            <input
+              type="file"
+              multiple
+              className="mt-1 block w-full text-sm text-gray-600"
+              onChange={handleUploadFiles}
+            />
+            {addModal.files.length > 0 ? (
+              <ul className="mt-2 text-xs text-gray-600 space-y-1">
+                {addModal.files.map((file) => (
+                  <li key={file.name} className="flex items-center justify-between">
+                    <span>{file.name}</span>
+                    <button className="text-red-500 text-xs" onClick={() => removeUploadFile(file.name)}>Xóa</button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-2 text-xs text-gray-500">Chưa có tệp được chọn.</p>
+            )}
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        open={profile.open}
+        title={profile.tenant ? `Hồ sơ khách thuê: ${profile.tenant.name}` : "Hồ sơ khách thuê"}
+        onClose={closeProfile}
+        footer={profile.editing ? (
+          <>
+            <Button variant="outline" onClick={cancelProfileEdit}>Hủy</Button>
+            <Button onClick={saveProfileEdit}>Lưu</Button>
+          </>
+        ) : (
+          <>
+            <Button variant="outline" onClick={closeProfile}>Đóng</Button>
+            <Button onClick={startProfileEdit}>Sửa</Button>
+          </>
+        )}
+      >
+        {profile.tenant ? (
+          <div className="space-y-4 text-sm text-gray-700">
+            {profile.editing ? (
+              <>
+                <section>
+                  <h4 className="text-sm font-semibold text-gray-800 uppercase">Thông tin cá nhân</h4>
+                  <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <Label>Họ tên</Label>
+                      <Input value={profileForm?.name || ""} onChange={(e) => updateProfileForm({ name: e.target.value })} />
+                    </div>
+                    <div>
+                      <Label>Giới tính</Label>
+                      <select
+                        className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                        value={profileForm?.gender || ""}
+                        onChange={(e) => updateProfileForm({ gender: e.target.value })}
+                      >
+                        <option value="">—</option>
+                        <option value="Nam">Nam</option>
+                        <option value="Nữ">Nữ</option>
+                        <option value="Khác">Khác</option>
+                      </select>
+                    </div>
+                    <div>
+                      <Label>Ngày sinh</Label>
+                      <Input type="date" value={profileForm?.dob || ""} onChange={(e) => updateProfileForm({ dob: e.target.value })} />
+                    </div>
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-sm font-semibold text-gray-800 uppercase">Giấy tờ & liên hệ</h4>
+                  <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                      <Label>Số CCCD/CMND</Label>
+                      <Input value={profileForm?.idCard || ""} onChange={(e) => updateProfileForm({ idCard: e.target.value })} />
+                    </div>
+                    <div>
+                      <Label>Ngày cấp</Label>
+                      <Input type="date" value={profileForm?.idCardIssueDate || ""} onChange={(e) => updateProfileForm({ idCardIssueDate: e.target.value })} />
+                    </div>
+                    <div>
+                      <Label>Nơi cấp</Label>
+                      <Input value={profileForm?.idCardIssuePlace || ""} onChange={(e) => updateProfileForm({ idCardIssuePlace: e.target.value })} />
+                    </div>
+                  </div>
+                  <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <Label>Số điện thoại</Label>
+                      <Input value={profileForm?.phone || ""} onChange={(e) => updateProfileForm({ phone: e.target.value })} />
+                    </div>
+                    <div>
+                      <Label>Số Zalo</Label>
+                      <Input value={profileForm?.zalo || ""} onChange={(e) => updateProfileForm({ zalo: e.target.value })} />
+                      <p className="text-xs text-gray-500 mt-1">Nếu để trống, hệ thống sẽ dùng số điện thoại làm số Zalo.</p>
+                    </div>
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-sm font-semibold text-gray-800 uppercase">Cư trú & vai trò</h4>
+                  <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="md:col-span-2">
+                      <Label>Hợp đồng liên kết</Label>
+                      <p className="mt-2 text-gray-700">
+                        {profile.contract
+                          ? `${profile.contract.code} · ${profile.room?.name || "(Chưa gán phòng)"}`
+                          : "—"}
+                      </p>
+                    </div>
+                    <div>
+                      <Label>Vai trò</Label>
+                      <select
+                        className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                        value={profileForm?.role || "PRIMARY"}
+                        onChange={(e) => updateProfileForm({ role: e.target.value })}
+                      >
+                        <option value="PRIMARY">Người đứng tên hợp đồng</option>
+                        <option value="CO">Người ở cùng</option>
+                      </select>
+                    </div>
+                    <div>
+                      <Label>Trạng thái cư trú</Label>
+                      {profile.party ? (
+                        <select
+                          className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                          value={profileForm?.status || profile.party?.status || "PENDING"}
+                          onChange={(e) => updateProfileForm({ status: e.target.value })}
+                        >
+                          {partyStatusOptions.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <p className="mt-2 text-gray-500">Chưa liên kết hợp đồng</p>
+                      )}
+                    </div>
+                    <div>
+                      <Label>Ngày vào ở</Label>
+                      <p className="mt-2 text-gray-700">{profile.party?.joinDate ? fdate(profile.party.joinDate) : "—"}</p>
+                    </div>
+                    <div>
+                      <Label>Ngày rời</Label>
+                      <p className="mt-2 text-gray-700">{profile.party?.endDate ? fdate(profile.party.endDate) : profile.party?.status === "LEFT" ? "Đang cập nhật" : "—"}</p>
+                    </div>
+                    <div>
+                      <Label>Ngày bắt đầu HĐ</Label>
+                      <p className="mt-2 text-gray-700">{profile.contract?.startDate ? fdate(profile.contract.startDate) : "—"}</p>
+                    </div>
+                    <div>
+                      <Label>Ngày kết thúc HĐ</Label>
+                      <p className="mt-2 text-gray-700">{profile.contract?.endDate ? fdate(profile.contract.endDate) : "—"}</p>
+                    </div>
+                    <div className="md:col-span-2">
+                      <Label>Trạng thái tạm trú</Label>
+                      <p className="mt-2 text-gray-700">{profile.contract?.residenceStatus || "—"}</p>
+                    </div>
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-sm font-semibold text-gray-800 uppercase">Thông tin bổ sung</h4>
+                  <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <Label>Nghề nghiệp</Label>
+                      <Input value={profileForm?.job || ""} onChange={(e) => updateProfileForm({ job: e.target.value })} />
+                    </div>
+                    <div className="md:col-span-2">
+                      <Label>Ghi chú</Label>
+                      <textarea
+                        className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                        rows={3}
+                        value={profileForm?.notes || ""}
+                        onChange={(e) => updateProfileForm({ notes: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                </section>
+              </>
+            ) : (
+              <>
+                <section>
+                  <h4 className="text-sm font-semibold text-gray-800 uppercase">Thông tin cá nhân</h4>
+                  <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div><span className="text-gray-500">Họ tên:</span> <strong>{profile.tenant.name}</strong></div>
+                    <div><span className="text-gray-500">Giới tính:</span> {profile.tenant.gender || "—"}</div>
+                    <div><span className="text-gray-500">Ngày sinh:</span> {profile.tenant.dob ? fdate(profile.tenant.dob) : "—"}</div>
+                    <div><span className="text-gray-500">Tuổi:</span> {tenantAge(profile.tenant.dob)}</div>
+                    <div><span className="text-gray-500">CCCD/CMND:</span> {profile.tenant.idCard || "—"}</div>
+                    <div><span className="text-gray-500">Ngày cấp:</span> {profile.tenant.idCardIssueDate ? fdate(profile.tenant.idCardIssueDate) : "—"}</div>
+                    <div><span className="text-gray-500">Nơi cấp:</span> {profile.tenant.idCardIssuePlace || "—"}</div>
+                    <div><span className="text-gray-500">Số điện thoại:</span> {profile.tenant.phone || "—"}</div>
+                    <div><span className="text-gray-500">Zalo:</span> {profile.tenant.zalo || profile.tenant.phone || "—"}</div>
+                    <div><span className="text-gray-500">Nghề nghiệp:</span> {profile.tenant.job || "—"}</div>
+                    <div className="md:col-span-2"><span className="text-gray-500">Ghi chú:</span> {profile.tenant.notes || "—"}</div>
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-sm font-semibold text-gray-800 uppercase">Thông tin cư trú</h4>
+                  <div className="mt-2 space-y-1">
+                    <div>
+                      Hợp đồng: {profile.contract ? `${profile.contract.code} · ${profile.room?.name || "(Chưa gán phòng)"}` : "—"}
+                    </div>
+                    <div>Nhà trọ: {profile.property?.name || "(Chưa gán)"}</div>
+                    <div>Phòng: {profile.room?.name || "(Chưa gán)"}</div>
+                    <div>Vai trò: {profile.party ? (profile.party.role === "PRIMARY" ? "Người đứng tên hợp đồng" : "Đồng cư") : "—"}</div>
+                    <div>
+                      Trạng thái cư trú: {profile.party ? (composePartyMeta(profile.party, profile.contract)?.label || "—") : "—"}
+                    </div>
+                    <div>Ngày vào ở: {profile.party?.joinDate ? fdate(profile.party.joinDate) : "—"}</div>
+                    <div>
+                      Ngày rời: {profile.party?.endDate ? fdate(profile.party.endDate) : profile.party?.status === "LEFT" ? "Đang cập nhật" : "—"}
+                    </div>
+                    <div>Ngày bắt đầu HĐ: {profile.contract?.startDate ? fdate(profile.contract.startDate) : "—"}</div>
+                    <div>Ngày kết thúc HĐ: {profile.contract?.endDate ? fdate(profile.contract.endDate) : "—"}</div>
+                <div>Trạng thái tạm trú: {profile.contract?.residenceStatus || "—"}</div>
+                {profile.party && (
+                  <div className="flex flex-wrap gap-2 pt-3">
+                    {profile.party.status === "PENDING" && (
+                      <Button variant="green" onClick={() => handleProfileStatusChange("ACTIVE")}>Kích hoạt cư trú</Button>
+                    )}
+                    {profile.party.status === "ACTIVE" && (
+                      <>
+                        <Button
+                          variant="outline"
+                          className="border-indigo-300 text-indigo-600 hover:bg-indigo-50"
+                          onClick={() => handleProfileStatusChange("PENDING")}
+                        >
+                          Chuyển tạm chờ
+                        </Button>
+                        <Button
+                          variant="outline"
+                          className="border-red-300 text-red-600 hover:bg-red-50"
+                          onClick={() => handleProfileStatusChange("LEFT")}
+                        >
+                          Đánh dấu rời
+                        </Button>
+                      </>
+                    )}
+                    {profile.party.status === "LEFT" && (
+                      <Button variant="green" onClick={() => handleProfileStatusChange("ACTIVE")}>Cho ở lại</Button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </section>
+              </>
+            )}
+
+            {profile.timeline.length > 0 && (
+              <section>
+                <h4 className="text-sm font-semibold text-gray-800 uppercase">Lịch sử tham gia hợp đồng</h4>
+                <div className="mt-2 space-y-2">
+                  {profile.timeline.map((entry) => {
+                    const entryContract = contracts.find((c) => c.id === entry.contractId);
+                    const meta = partyStatusMeta[entry.status] || partyStatusMeta.PENDING;
+                    return (
+                      <div key={entry.id} className="border border-gray-200 rounded-md p-3 bg-gray-50">
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-medium text-gray-700">{entry.role === "PRIMARY" ? "Người đứng tên" : "Đồng cư"}</span>
+                          <Badge color={meta.color}>{meta.label}</Badge>
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1">
+                          {entry.joinDate ? fdate(entry.joinDate) : "—"} → {entry.endDate ? fdate(entry.endDate) : entry.status === "LEFT" ? "Đang cập nhật" : "Hiện tại"}
+                        </div>
+                        <div className="text-xs text-gray-400 mt-1">Hợp đồng: {entryContract?.code || "—"}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+
+            <section>
+              <h4 className="text-sm font-semibold text-gray-800 uppercase">Tệp đính kèm</h4>
+              {profile.tenant.files && profile.tenant.files.length > 0 ? (
+                <ul className="mt-2 list-disc list-inside space-y-1">
+                  {profile.tenant.files.map((file) => (
+                    <li key={file}>{file}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-xs text-gray-500">Chưa có tệp đính kèm.</p>
+              )}
+            </section>
+          </div>
+        ) : (
+          <p className="text-sm text-gray-500">Không tìm thấy thông tin khách thuê.</p>
+        )}
+      </Modal>
     </Card>
   );
 }
@@ -2810,6 +3808,8 @@ function SettingsView() {
     "room:create": { label: "Phòng - Thêm", badge: "green" },
     "room:update": { label: "Phòng - Cập nhật", badge: "blue" },
     "room:delete": { label: "Phòng - Xóa", badge: "red" },
+    "tenant:create": { label: "Khách thuê - Thêm", badge: "green" },
+    "tenant:view": { label: "Khách thuê - Xem hồ sơ", badge: "blue" },
     "contract:create": { label: "Hợp đồng - Tạo", badge: "green" },
     "contract:update": { label: "Hợp đồng - Cập nhật", badge: "blue" },
     "contract:terminate": { label: "Hợp đồng - Chấm dứt", badge: "yellow" },
@@ -2882,6 +3882,11 @@ function SettingsView() {
 function Shell() {
   const location = useLocation();
   const today = new Date().toLocaleDateString("vi-VN", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  useEffect(() => {
+    setMobileMenuOpen(false);
+  }, [location.pathname]);
 
   const nav = [
     { path: "/dashboard", label: "Bảng điều khiển", icon: LayoutDashboard },
@@ -2900,7 +3905,7 @@ function Shell() {
   return (
     <div className="bg-gray-100 font-sans min-h-screen">
       <div className="flex h-screen bg-gray-200">
-        {/* Sidebar */}
+        {/* Sidebar desktop */}
         <aside className="hidden md:block w-64 bg-white shadow-lg">
           <div className="flex items-center justify-center h-20 border-b">
             <h1 className="text-2xl font-bold text-indigo-600">Trọ Tốt</h1>
@@ -2922,12 +3927,57 @@ function Shell() {
           </nav>
         </aside>
 
+        {/* Sidebar mobile */}
+        <aside
+          className={`fixed inset-y-0 left-0 z-40 w-64 bg-white shadow-lg transform transition-transform duration-200 md:hidden ${
+            mobileMenuOpen ? "translate-x-0" : "-translate-x-full"
+          }`}
+        >
+          <div className="flex items-center justify-between h-16 px-4 border-b">
+            <h1 className="text-xl font-bold text-indigo-600">Trọ Tốt</h1>
+            <button
+              className="text-gray-500 focus:outline-none"
+              aria-label="Đóng menu"
+              onClick={() => setMobileMenuOpen(false)}
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+          <nav className="mt-4 px-2">
+            {nav.map((item) => {
+              const Icon = item.icon;
+              const activeCls = activePath.startsWith(item.path) ? "bg-indigo-500 text-white" : "text-gray-700 hover:bg-indigo-500 hover:text-white";
+              return (
+                <Link
+                  key={item.path}
+                  to={item.path}
+                  className={`group flex items-center w-full text-left px-4 py-3 rounded-md ${activeCls}`}
+                >
+                  <Icon className="mr-3 h-5 w-5" /> {item.label}
+                </Link>
+              );
+            })}
+          </nav>
+        </aside>
+
+        {mobileMenuOpen && (
+          <div
+            className="fixed inset-0 z-30 bg-black/40 md:hidden"
+            onClick={() => setMobileMenuOpen(false)}
+            aria-hidden="true"
+          />
+        )}
+
         {/* Main content */}
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Header */}
           <header className="flex justify-between items-center p-4 bg-white border-b">
             <div className="flex items-center">
-              <button className="text-gray-500 focus:outline-none md:hidden mr-2">
+              <button
+                className="text-gray-500 focus:outline-none md:hidden mr-2"
+                aria-label="Mở menu"
+                onClick={() => setMobileMenuOpen(true)}
+              >
                 <Menu className="h-6 w-6" />
               </button>
               <h2 className="text-2xl font-semibold text-gray-800">{activeLabel}</h2>
