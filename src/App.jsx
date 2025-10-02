@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import {
   LayoutDashboard,
   Home,
@@ -14,8 +14,12 @@ import {
   Plus,
   Save,
   AlertCircle,
+  AlertTriangle,
   Building2,
   FileText,
+  BarChart3,
+  ClipboardPaste,
+  FileDown,
   CalendarDays,
   Zap,
   Droplet,
@@ -26,6 +30,7 @@ import {
   Pencil,
   Trash2,
   X,
+  Wifi,
 } from "lucide-react";
 import { HashRouter, Routes, Route, Link, Navigate, useParams, useSearchParams, useLocation, useNavigate } from "react-router-dom";
 
@@ -59,9 +64,9 @@ const Button = ({ variant = "primary", className = "", children, ...props }) => 
     </button>
   );
 };
-const Input = (props) => (
+const Input = ({ className = "", ...props }) => (
   <input
-    className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+    className={`mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm ${className}`}
     {...props}
   />
 );
@@ -403,6 +408,411 @@ const maints = [
   { id: 6, roomId: 101, request: "Thay bóng đèn nhà tắm", status: "Đã hoàn thành", priority: "Thấp", cost: 50000 },
 ];
 
+const serviceCatalogSeed = [
+  { id: "electricity", name: "Điện", unitPrice: 3500, method: "meter", unit: "kWh", locked: true },
+  { id: "water", name: "Nước", unitPrice: 18000, method: "meter", unit: "m³", locked: true },
+  { id: "wifi", name: "Wifi", unitPrice: 65000, method: "per-room" },
+  { id: "trash", name: "Rác sinh hoạt", unitPrice: 30000, method: "per-room" },
+  { id: "security", name: "An ninh", unitPrice: 50000, method: "per-person" },
+];
+
+const serviceUsageSeedMonths = ["2025-08", "2025-09"];
+const serviceUsageSeed = contracts.flatMap((contract) => {
+  if (!["ACTIVE", "ENDING", "DRAFT"].includes(contract.status)) return [];
+  const hasWifiFee = (contract.serviceFees || []).some((fee) => fee.label?.toLowerCase().includes("wifi"));
+  const hasTrashFee = (contract.serviceFees || []).some((fee) => fee.label?.toLowerCase().includes("rác"));
+  const baseElectric = contract.meterBaseline?.electricity ?? 0;
+  const baseWater = contract.meterBaseline?.water ?? 0;
+
+  return serviceUsageSeedMonths.map((month, index) => {
+    const monthFactor = index + 1;
+    return {
+      id: `${contract.id}-${month}`,
+      contractId: contract.id,
+      month,
+      electricity: {
+        current: baseElectric ? baseElectric + 18 * monthFactor : null,
+      },
+      water: {
+        current: baseWater ? baseWater + 6 * monthFactor : null,
+      },
+      wifiDevices: hasWifiFee ? 2 + index : 0,
+      trashIncluded: hasTrashFee,
+      otherAdjustments: { amount: 0, note: "" },
+    };
+  });
+});
+
+const ServiceContext = createContext({
+  serviceCatalog: [],
+  addService: () => {},
+  updateService: () => {},
+  removeService: () => {},
+  serviceUsage: [],
+  upsertUsageRecord: () => {},
+  ensureMonthRecords: () => {},
+  previousMonth: () => null,
+  nextMonth: () => null,
+});
+
+const useServices = () => useContext(ServiceContext);
+
+const previousMonth = (month) => {
+  if (!month) return null;
+  const [year, rawMonth] = month.split("-").map(Number);
+  if (!year || !rawMonth) return null;
+  const date = new Date(Date.UTC(year, rawMonth - 1, 1));
+  date.setUTCMonth(date.getUTCMonth() - 1);
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+};
+
+const nextMonth = (month) => {
+  if (!month) return null;
+  const [year, rawMonth] = month.split("-").map(Number);
+  if (!year || !rawMonth) return null;
+  const date = new Date(Date.UTC(year, rawMonth - 1, 1));
+  date.setUTCMonth(date.getUTCMonth() + 1);
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+};
+
+function ServiceProvider({ children }) {
+  const [serviceCatalog, setServiceCatalog] = useState(serviceCatalogSeed);
+  const [serviceUsage, setServiceUsage] = useState(serviceUsageSeed);
+
+  const addService = (service) => {
+    if (!service?.name?.trim()) return;
+    const name = service.name.trim();
+    const baseId = name
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    const uniqueId = baseId && !serviceCatalog.some((item) => item.id === baseId)
+      ? baseId
+      : `${baseId || "service"}-${Date.now().toString(16)}`;
+    const payload = {
+      id: uniqueId,
+      name,
+      unitPrice: Number(service.unitPrice) || 0,
+      method: service.method || "per-room",
+      unit: service.unit || "",
+    };
+    setServiceCatalog((prev) => [...prev, payload]);
+  };
+
+  const updateService = (id, patch) => {
+    setServiceCatalog((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  };
+
+  const removeService = (id) => {
+    const target = serviceCatalog.find((item) => item.id === id);
+    if (target?.locked) return;
+    setServiceCatalog((prev) => prev.filter((item) => item.id !== id));
+  };
+
+  const upsertUsageRecord = (contractId, month, patch) => {
+    if (!contractId || !month) return;
+    setServiceUsage((prev) => {
+      const idx = prev.findIndex((item) => item.contractId === contractId && item.month === month);
+      if (idx === -1) {
+        return [
+          ...prev,
+          {
+            id: `${contractId}-${month}`,
+            contractId,
+            month,
+            electricity: { current: null },
+            water: { current: null },
+            wifiDevices: 0,
+            trashIncluded: false,
+            otherAdjustments: { amount: 0, note: "" },
+            ...patch,
+          },
+        ];
+      }
+      const next = [...prev];
+      next[idx] = {
+        ...next[idx],
+        ...patch,
+        electricity: patch?.electricity
+          ? { ...next[idx].electricity, ...patch.electricity }
+          : next[idx].electricity,
+        water: patch?.water ? { ...next[idx].water, ...patch.water } : next[idx].water,
+        otherAdjustments: patch?.otherAdjustments
+          ? { ...next[idx].otherAdjustments, ...patch.otherAdjustments }
+          : next[idx].otherAdjustments,
+      };
+      return next;
+    });
+  };
+
+  const ensureMonthRecords = (month, contractList) => {
+    if (!month || !Array.isArray(contractList) || contractList.length === 0) return;
+    setServiceUsage((prev) => {
+      const exists = prev.some((item) => item.month === month);
+      if (exists) return prev;
+      const additions = contractList.map((contract) => {
+        const previous = [...prev]
+          .filter((item) => item.contractId === contract.id)
+          .sort((a, b) => a.month.localeCompare(b.month))
+          .slice(-1)[0];
+        const electricCurrent = previous?.electricity?.current ?? contract.meterBaseline?.electricity ?? null;
+        const waterCurrent = previous?.water?.current ?? contract.meterBaseline?.water ?? null;
+        const wifiDevices = contract.status === "TERMINATED"
+          ? 0
+          : previous?.wifiDevices ?? ((contract.serviceFees || []).some((fee) => fee.label?.toLowerCase().includes("wifi")) ? 1 : 0);
+        const trashIncluded = previous?.trashIncluded ?? ((contract.serviceFees || []).some((fee) => fee.label?.toLowerCase().includes("rác")));
+
+        return {
+          id: `${contract.id}-${month}`,
+          contractId: contract.id,
+          month,
+          electricity: { current: electricCurrent },
+          water: { current: waterCurrent },
+          wifiDevices,
+          trashIncluded,
+          otherAdjustments: previous?.otherAdjustments ? { ...previous.otherAdjustments } : { amount: 0, note: "" },
+        };
+      });
+      return [...prev, ...additions];
+    });
+  };
+
+  const value = useMemo(
+    () => ({
+      serviceCatalog,
+      addService,
+      updateService,
+      removeService,
+      serviceUsage,
+      upsertUsageRecord,
+      ensureMonthRecords,
+      previousMonth,
+      nextMonth,
+    }),
+    [serviceCatalog, serviceUsage]
+  );
+
+  return <ServiceContext.Provider value={value}>{children}</ServiceContext.Provider>;
+}
+
+const getServiceMonths = (usage) => {
+  const distinct = new Set((usage || []).map((item) => item.month));
+  return Array.from(distinct).sort((a, b) => a.localeCompare(b));
+};
+
+const findServiceRecord = (usage, contractId, month) => {
+  if (!month) return null;
+  return (usage || []).find((item) => item.contractId === contractId && item.month === month) || null;
+};
+
+const getPreviousMeterValue = (contract, usage, month, key, previousMonthFn) => {
+  if (!contract) return null;
+  if (!month) {
+    return contract.meterBaseline?.[key] ?? null;
+  }
+  let cursor = previousMonthFn(month);
+  const startMonth = contract.startDate ? contract.startDate.slice(0, 7) : null;
+  const maxLookback = 60;
+  let steps = 0;
+  while (cursor && steps < maxLookback) {
+    if (startMonth && cursor < startMonth) break;
+    const record = findServiceRecord(usage, contract.id, cursor);
+    const value = record?.[key]?.current;
+    if (value != null) return value;
+    cursor = previousMonthFn(cursor);
+    steps += 1;
+  }
+  return contract.meterBaseline?.[key] ?? null;
+};
+
+const computeMeterConsumptionValue = (contract, usage, month, key, previousMonthFn) => {
+  if (!contract || !month) return null;
+  const record = findServiceRecord(usage, contract.id, month);
+  const current = record?.[key]?.current;
+  if (current == null) return null;
+  const previousValue = getPreviousMeterValue(contract, usage, month, key, previousMonthFn);
+  if (previousValue == null) return null;
+  return current - previousValue;
+};
+
+const summarizeContractServices = (contract, usage, catalog, month, previousMonthFn, overrides = null) => {
+  if (!contract || !month) return null;
+  const electricityCatalog = catalog.find((item) => item.id === "electricity") || null;
+  const waterCatalog = catalog.find((item) => item.id === "water") || null;
+  const wifiCatalog = catalog.find((item) => item.id === "wifi") || null;
+  const trashCatalog = catalog.find((item) => item.id === "trash") || null;
+  const securityCatalog = catalog.find((item) => item.id === "security") || null;
+
+  const overrideEntry = overrides?.[contract.id];
+  const override = overrideEntry && overrideEntry.month === month ? overrideEntry : null;
+
+  const baseRecord = findServiceRecord(usage, contract.id, month);
+  let record = baseRecord || {
+    id: `${contract.id}-${month}`,
+    contractId: contract.id,
+    month,
+    electricity: { current: null },
+    water: { current: null },
+    wifiDevices: 0,
+    trashIncluded: false,
+    otherAdjustments: { amount: 0, note: "" },
+  };
+
+  if (override) {
+    if (override.electricCurrent !== undefined) {
+      record = {
+        ...record,
+        electricity: {
+          ...(record.electricity || {}),
+          current: override.electricCurrent,
+        },
+      };
+    }
+    if (override.waterCurrent !== undefined) {
+      record = {
+        ...record,
+        water: {
+          ...(record.water || {}),
+          current: override.waterCurrent,
+        },
+      };
+    }
+    if (override.wifiDevices !== undefined) {
+      record = {
+        ...record,
+        wifiDevices: override.wifiDevices,
+      };
+    }
+    if (override.trashIncluded !== undefined) {
+      record = {
+        ...record,
+        trashIncluded: override.trashIncluded,
+      };
+    }
+    if (override.otherAmount !== undefined || override.note !== undefined) {
+      const baseAdj = record.otherAdjustments || { amount: 0, note: "" };
+      record = {
+        ...record,
+        otherAdjustments: {
+          amount: override.otherAmount !== undefined ? override.otherAmount : baseAdj.amount,
+          note: override.note !== undefined ? override.note : baseAdj.note,
+        },
+      };
+    }
+  }
+
+  const electricityPrev = getPreviousMeterValue(contract, usage, month, "electricity", previousMonthFn);
+  const waterPrev = getPreviousMeterValue(contract, usage, month, "water", previousMonthFn);
+  const electricityCurrent = record?.electricity?.current ?? null;
+  const waterCurrent = record?.water?.current ?? null;
+  const electricityConsumption = computeMeterConsumptionValue(contract, usage, month, "electricity", previousMonthFn);
+  const waterConsumption = computeMeterConsumptionValue(contract, usage, month, "water", previousMonthFn);
+  const prevMonthKey = previousMonthFn(month);
+  const prevElectricityConsumption = computeMeterConsumptionValue(contract, usage, prevMonthKey, "electricity", previousMonthFn);
+  const prevWaterConsumption = computeMeterConsumptionValue(contract, usage, prevMonthKey, "water", previousMonthFn);
+
+  const electricityRate = contract.electricityRate || electricityCatalog?.unitPrice || 0;
+  const waterRate = contract.waterRate || waterCatalog?.unitPrice || 0;
+  const electricityAmount = electricityConsumption && electricityConsumption > 0 ? electricityConsumption * electricityRate : 0;
+  const waterAmount = waterConsumption && waterConsumption > 0 ? waterConsumption * waterRate : 0;
+
+  const wifiDevices = contract.status === "TERMINATED" ? 0 : record?.wifiDevices ?? 0;
+  const wifiAmount = wifiDevices * (wifiCatalog?.unitPrice || 0);
+  const trashIncluded = !!record?.trashIncluded;
+  const trashAmount = trashIncluded ? trashCatalog?.unitPrice || 0 : 0;
+  const occupants = ["ACTIVE", "ENDING"].includes(contract.status)
+    ? 1 + (contract.dependents?.length || 0)
+    : 0;
+  const securityAmount = occupants * (securityCatalog?.unitPrice || 0);
+  const otherNote = record?.otherAdjustments?.note || "";
+  const otherAmount = Number(record?.otherAdjustments?.amount || 0);
+  const totalAmount = electricityAmount + waterAmount + wifiAmount + trashAmount + securityAmount + otherAmount;
+
+  const electricityDelta =
+    electricityConsumption != null && prevElectricityConsumption != null
+      ? electricityConsumption - prevElectricityConsumption
+      : null;
+  const waterDelta =
+    waterConsumption != null && prevWaterConsumption != null
+      ? waterConsumption - prevWaterConsumption
+      : null;
+
+  const alerts = [];
+  if (electricityConsumption != null && electricityConsumption < 0) {
+    alerts.push("Chỉ số điện âm – cần kiểm tra lại.");
+  }
+  if (waterConsumption != null && waterConsumption < 0) {
+    alerts.push("Chỉ số nước âm – cần kiểm tra lại.");
+  }
+  if (prevElectricityConsumption != null && electricityConsumption != null && prevElectricityConsumption > 0 && electricityConsumption >= prevElectricityConsumption * 1.5) {
+    alerts.push("Điện tăng trên 50% so với kỳ trước.");
+  }
+  if (prevWaterConsumption != null && waterConsumption != null && prevWaterConsumption > 0 && waterConsumption >= prevWaterConsumption * 1.5) {
+    alerts.push("Nước tăng trên 50% so với kỳ trước.");
+  }
+
+  return {
+    month,
+    record,
+    electricity: {
+      prev: electricityPrev,
+      current: electricityCurrent,
+      consumption: electricityConsumption,
+      previousConsumption: prevElectricityConsumption,
+      delta: electricityDelta,
+      rate: electricityRate,
+      amount: electricityAmount,
+    },
+    water: {
+      prev: waterPrev,
+      current: waterCurrent,
+      consumption: waterConsumption,
+      previousConsumption: prevWaterConsumption,
+      delta: waterDelta,
+      rate: waterRate,
+      amount: waterAmount,
+    },
+    wifi: {
+      devices: wifiDevices,
+      amount: wifiAmount,
+    },
+    trash: {
+      included: trashIncluded,
+      amount: trashAmount,
+    },
+    security: {
+      occupants,
+      amount: securityAmount,
+    },
+    other: {
+      amount: otherAmount,
+      note: otherNote,
+    },
+    total: totalAmount,
+    alerts,
+  };
+};
+
+const formatBillingMonth = (month) => {
+  if (!month) return "—";
+  const [year, monthPart] = month.split("-").map(Number);
+  if (!year || !monthPart) return month;
+  const date = new Date(year, monthPart - 1, 1);
+  return date.toLocaleDateString("vi-VN", { month: "2-digit", year: "numeric" });
+};
+
+const guessBuildingCode = (room) => {
+  if (!room?.name) return "Khác";
+  const match = room.name.match(/^[A-Za-z]+/);
+  return (match ? match[0] : room.name.charAt(0) || "Khác").toUpperCase();
+};
+
 // ===== Generic Modal =====
 function Modal({ open, title, children, onClose, footer }) {
   if (!open) return null;
@@ -714,6 +1124,9 @@ function PropertiesView() {
   const [roomModal, setRoomModal] = useState({ open: false, room: null });
   const [roomForm, setRoomForm] = useState({ open: false, mode: "add", current: null });
   const [roomEditMode, setRoomEditMode] = useState(false);
+  const { serviceUsage, serviceCatalog, previousMonth } = useServices();
+  const serviceMonths = useMemo(() => getServiceMonths(serviceUsage), [serviceUsage]);
+  const activeServiceMonth = serviceMonths.length ? serviceMonths[serviceMonths.length - 1] : null;
 
   useEffect(() => {
     if (items.length === 0) {
@@ -734,6 +1147,63 @@ function PropertiesView() {
   const currentRoomTenant = currentRoom?.tenantId ? tenants.find((t) => t.id === currentRoom.tenantId) : null;
   const currentRoomContract = currentRoom ? contracts.find((c) => c.roomId === currentRoom.id) : null;
   const { appendLog } = useActionLog();
+
+  const currentRoomServiceSummary = useMemo(() => {
+    if (!currentRoomContract || !activeServiceMonth) return null;
+    return summarizeContractServices(currentRoomContract, serviceUsage, serviceCatalog, activeServiceMonth, previousMonth);
+  }, [currentRoomContract, activeServiceMonth, serviceUsage, serviceCatalog, previousMonth]);
+
+  const propertyServiceOverview = useMemo(() => {
+    if (!selectedPropertyId || !activeServiceMonth) return null;
+    const relatedContracts = contracts.filter((contract) => {
+      const room = rooms.find((r) => r.id === contract.roomId);
+      if (!room) return false;
+      return room.propertyId === selectedPropertyId && ["ACTIVE", "ENDING"].includes(contract.status);
+    });
+    if (relatedContracts.length === 0) return null;
+    const summary = relatedContracts.reduce(
+      (acc, contract) => {
+        const evalSummary = summarizeContractServices(contract, serviceUsage, serviceCatalog, activeServiceMonth, previousMonth);
+        if (!evalSummary) return acc;
+        acc.contracts += 1;
+        if (evalSummary.electricity.consumption != null && evalSummary.electricity.consumption > 0) {
+          acc.electricityConsumption += evalSummary.electricity.consumption;
+        }
+        acc.electricityAmount += evalSummary.electricity.amount;
+        if (evalSummary.water.consumption != null && evalSummary.water.consumption > 0) {
+          acc.waterConsumption += evalSummary.water.consumption;
+        }
+        acc.waterAmount += evalSummary.water.amount;
+        acc.wifiDevices += evalSummary.wifi.devices;
+        acc.wifiAmount += evalSummary.wifi.amount;
+        if (evalSummary.trash.included) {
+          acc.trashContracts += 1;
+        }
+        acc.trashAmount += evalSummary.trash.amount;
+        acc.securityPeople += evalSummary.security.occupants;
+        acc.securityAmount += evalSummary.security.amount;
+        acc.otherAmount += evalSummary.other.amount;
+        acc.totalAmount += evalSummary.total;
+        return acc;
+      },
+      {
+        contracts: 0,
+        electricityConsumption: 0,
+        electricityAmount: 0,
+        waterConsumption: 0,
+        waterAmount: 0,
+        wifiDevices: 0,
+        wifiAmount: 0,
+        trashContracts: 0,
+        trashAmount: 0,
+        securityPeople: 0,
+        securityAmount: 0,
+        otherAmount: 0,
+        totalAmount: 0,
+      }
+    );
+    return summary.contracts > 0 ? summary : null;
+  }, [selectedPropertyId, activeServiceMonth, serviceUsage, serviceCatalog, previousMonth]);
 
   const openAdd = () => setModal({ open: true, mode: "add", current: { name: "", address: "", businessOwner: "" } });
   const openEdit = (p) => setModal({ open: true, mode: "edit", current: { ...p, businessOwner: p.businessOwner || "" } });
@@ -1012,6 +1482,49 @@ function PropertiesView() {
         </div>
       </Card>
 
+      {selectedProperty && propertyServiceOverview && activeServiceMonth && (
+        <Card className="p-6 space-y-4">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+            <div>
+              <h3 className="text-lg font-semibold text-gray-800">Dịch vụ tại {selectedProperty.name}</h3>
+              <p className="text-sm text-gray-600">Kỳ ghi nhận {formatBillingMonth(activeServiceMonth)} trên {propertyServiceOverview.contracts} hợp đồng đang hoạt động.</p>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4 text-sm text-gray-600">
+            <div>
+              <p className="text-xs uppercase text-gray-500">Điện</p>
+              <p className="text-lg font-semibold text-gray-800">{propertyServiceOverview.electricityConsumption.toLocaleString("vi-VN") || 0} kWh</p>
+              <p className="text-xs text-gray-500">{currency(propertyServiceOverview.electricityAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Nước</p>
+              <p className="text-lg font-semibold text-gray-800">{propertyServiceOverview.waterConsumption.toLocaleString("vi-VN") || 0} m³</p>
+              <p className="text-xs text-gray-500">{currency(propertyServiceOverview.waterAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Wifi</p>
+              <p className="text-lg font-semibold text-gray-800">{propertyServiceOverview.wifiDevices} thiết bị</p>
+              <p className="text-xs text-gray-500">{currency(propertyServiceOverview.wifiAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Phòng tính phí rác</p>
+              <p className="text-lg font-semibold text-gray-800">{propertyServiceOverview.trashContracts}</p>
+              <p className="text-xs text-gray-500">{currency(propertyServiceOverview.trashAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Nhân khẩu an ninh</p>
+              <p className="text-lg font-semibold text-gray-800">{propertyServiceOverview.securityPeople}</p>
+              <p className="text-xs text-gray-500">{currency(propertyServiceOverview.securityAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Điều chỉnh khác</p>
+              <p className="text-lg font-semibold text-gray-800">{currency(propertyServiceOverview.otherAmount)}</p>
+              <p className="text-xs text-gray-500">Tổng cộng: {currency(propertyServiceOverview.totalAmount)}</p>
+            </div>
+          </div>
+        </Card>
+      )}
+
       <Card className="p-6">
         <div className="flex justify-between items-center mb-4">
           <div>
@@ -1173,6 +1686,49 @@ function PropertiesView() {
                   <div>
                     <span className="text-gray-500">Ghi chú:</span>
                     <span className="ml-2 font-medium text-gray-800">{currentRoomContract.note || "—"}</span>
+                  </div>
+                </div>
+              </Card>
+            )}
+
+            {currentRoomServiceSummary && (
+              <Card className="p-4 bg-white border border-indigo-100 shadow-sm">
+                <h4 className="font-semibold text-gray-800 mb-2 flex items-center gap-2">
+                  <Zap className="h-4 w-4 text-indigo-500" /> Dịch vụ kỳ {formatBillingMonth(currentRoomServiceSummary.month)}
+                </h4>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm text-gray-600">
+                  <div>
+                    <p className="text-xs uppercase text-gray-500">Điện</p>
+                    <p>Tiêu thụ: {currentRoomServiceSummary.electricity.consumption != null ? `${currentRoomServiceSummary.electricity.consumption} kWh` : "—"}</p>
+                    <p>Thành tiền: {currency(currentRoomServiceSummary.electricity.amount)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase text-gray-500">Nước</p>
+                    <p>Tiêu thụ: {currentRoomServiceSummary.water.consumption != null ? `${currentRoomServiceSummary.water.consumption} m³` : "—"}</p>
+                    <p>Thành tiền: {currency(currentRoomServiceSummary.water.amount)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase text-gray-500">Wifi</p>
+                    <p>Thiết bị: {currentRoomServiceSummary.wifi.devices}</p>
+                    <p>Thành tiền: {currency(currentRoomServiceSummary.wifi.amount)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase text-gray-500">Phí rác & an ninh</p>
+                    <p>Rác: {currentRoomServiceSummary.trash.included ? currency(currentRoomServiceSummary.trash.amount) : "Không tính"}</p>
+                    <p>An ninh: {currency(currentRoomServiceSummary.security.amount)} ({currentRoomServiceSummary.security.occupants} người)</p>
+                  </div>
+                </div>
+                <div className="mt-3 text-sm text-gray-600 border-t pt-3">
+                  <div className="flex justify-between">
+                    <span>Điều chỉnh khác</span>
+                    <span className="font-medium text-gray-800">{currency(currentRoomServiceSummary.other.amount)}</span>
+                  </div>
+                  {currentRoomServiceSummary.other.note && (
+                    <p className="text-xs text-gray-500 mt-1">Ghi chú: {currentRoomServiceSummary.other.note}</p>
+                  )}
+                  <div className="flex justify-between items-center mt-3 pt-3 border-t">
+                    <span className="text-sm text-gray-600">Tổng dịch vụ</span>
+                    <span className="text-lg font-semibold text-indigo-600">{currency(currentRoomServiceSummary.total)}</span>
                   </div>
                 </div>
               </Card>
@@ -1541,6 +2097,7 @@ function TenantsView() {
   const [profile, setProfile] = useState({ open: false, tenant: null, room: null, property: null, contract: null, party: null, timeline: [], editing: false });
   const [profileForm, setProfileForm] = useState(null);
   const [propertyFilter, setPropertyFilter] = useState("all");
+  const [statsMonthFilter, setStatsMonthFilter] = useState("current");
   const [statusFilter, setStatusFilter] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
 
@@ -2544,6 +3101,9 @@ function ContractsView() {
   const [contractDelete, setContractDelete] = useState({ open: false, record: null });
   const [contractTerminate, setContractTerminate] = useState({ open: false, record: null, endDate: new Date().toISOString().slice(0, 10), note: "" });
   const { appendLog } = useActionLog();
+  const { serviceUsage, serviceCatalog, previousMonth } = useServices();
+  const serviceMonths = useMemo(() => getServiceMonths(serviceUsage), [serviceUsage]);
+  const activeServiceMonth = serviceMonths.length ? serviceMonths[serviceMonths.length - 1] : null;
 
   function getAvailableRooms(propertyId, currentRoomId = null) {
     const pid = Number(propertyId);
@@ -2631,6 +3191,9 @@ function ContractsView() {
         return db - da;
       });
       const lastInvoice = orderedInvoices[0] || null;
+      const serviceSummary = activeServiceMonth
+        ? summarizeContractServices(contract, serviceUsage, serviceCatalog, activeServiceMonth, previousMonth)
+        : null;
 
       return {
         contract,
@@ -2643,9 +3206,55 @@ function ContractsView() {
         meterBaseline,
         invoices: invoicesOf,
         lastInvoice,
+        serviceSummary,
       };
     });
-  }, [contractItems]);
+  }, [contractItems, activeServiceMonth, serviceUsage, serviceCatalog, previousMonth]);
+
+  const serviceOverview = useMemo(() => {
+    if (!activeServiceMonth) return null;
+    return contractRecords.reduce(
+      (acc, record) => {
+        const summary = record.serviceSummary;
+        if (!summary) return acc;
+        acc.contracts += 1;
+        if (summary.electricity.consumption != null && summary.electricity.consumption > 0) {
+          acc.electricityConsumption += summary.electricity.consumption;
+        }
+        acc.electricityAmount += summary.electricity.amount;
+        if (summary.water.consumption != null && summary.water.consumption > 0) {
+          acc.waterConsumption += summary.water.consumption;
+        }
+        acc.waterAmount += summary.water.amount;
+        acc.wifiDevices += summary.wifi.devices;
+        acc.wifiAmount += summary.wifi.amount;
+        if (summary.trash.included) {
+          acc.trashContracts += 1;
+        }
+        acc.trashAmount += summary.trash.amount;
+        acc.securityPeople += summary.security.occupants;
+        acc.securityAmount += summary.security.amount;
+        acc.otherAmount += summary.other.amount;
+        acc.totalAmount += summary.total;
+        return acc;
+      },
+      {
+        contracts: 0,
+        electricityConsumption: 0,
+        electricityAmount: 0,
+        waterConsumption: 0,
+        waterAmount: 0,
+        wifiDevices: 0,
+        wifiAmount: 0,
+        trashContracts: 0,
+        trashAmount: 0,
+        securityPeople: 0,
+        securityAmount: 0,
+        otherAmount: 0,
+        totalAmount: 0,
+      }
+    );
+  }, [contractRecords, activeServiceMonth]);
 
   const now = useMemo(() => new Date(), []);
   const soonThreshold = useMemo(
@@ -2726,6 +3335,7 @@ function ContractsView() {
   const closeDetail = () => setDetail({ open: false, record: null });
 
   const detailRecord = detail.record;
+  const detailServiceSummary = detailRecord?.serviceSummary || null;
   const isEditingContract = contractForm.mode === "edit";
   const editingContract = isEditingContract && contractForm.contractId
     ? contractItems.find((item) => item.id === contractForm.contractId)
@@ -3022,6 +3632,49 @@ function ContractsView() {
         </Card>
       </div>
 
+      {activeServiceMonth && serviceOverview && serviceOverview.contracts > 0 && (
+        <Card className="p-6 space-y-4">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+            <div>
+              <h3 className="text-lg font-semibold text-gray-800">Thống kê dịch vụ đang sử dụng</h3>
+              <p className="text-sm text-gray-600">Tổng hợp dữ liệu ghi nhận kỳ {formatBillingMonth(activeServiceMonth)} trên {serviceOverview.contracts} hợp đồng.</p>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-6 gap-4 text-sm text-gray-600">
+            <div>
+              <p className="text-xs uppercase text-gray-500">Điện tiêu thụ</p>
+              <p className="text-lg font-semibold text-gray-800">{serviceOverview.electricityConsumption.toLocaleString("vi-VN") || 0} kWh</p>
+              <p className="text-xs text-gray-500">{currency(serviceOverview.electricityAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Nước tiêu thụ</p>
+              <p className="text-lg font-semibold text-gray-800">{serviceOverview.waterConsumption.toLocaleString("vi-VN") || 0} m³</p>
+              <p className="text-xs text-gray-500">{currency(serviceOverview.waterAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Thiết bị Wifi</p>
+              <p className="text-lg font-semibold text-gray-800">{serviceOverview.wifiDevices}</p>
+              <p className="text-xs text-gray-500">{currency(serviceOverview.wifiAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Phòng tính phí rác</p>
+              <p className="text-lg font-semibold text-gray-800">{serviceOverview.trashContracts}</p>
+              <p className="text-xs text-gray-500">{currency(serviceOverview.trashAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Nhân khẩu tính an ninh</p>
+              <p className="text-lg font-semibold text-gray-800">{serviceOverview.securityPeople}</p>
+              <p className="text-xs text-gray-500">{currency(serviceOverview.securityAmount)}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase text-gray-500">Điều chỉnh khác</p>
+              <p className="text-lg font-semibold text-gray-800">{currency(serviceOverview.otherAmount)}</p>
+              <p className="text-xs text-gray-500">Tổng dịch vụ: {currency(serviceOverview.totalAmount)}</p>
+            </div>
+          </div>
+        </Card>
+      )}
+
       <Card className="p-4">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
@@ -3243,6 +3896,70 @@ function ContractsView() {
                 </div>
               )}
             </Card>
+
+            {detailServiceSummary && (
+              <Card className="p-4 bg-white border border-indigo-100 shadow-sm">
+                <h4 className="text-sm font-semibold text-gray-800 flex items-center gap-2">
+                  <Zap className="h-4 w-4 text-indigo-500" /> Dịch vụ kỳ {formatBillingMonth(detailServiceSummary.month)}
+                </h4>
+                {detailServiceSummary.alerts.length > 0 && (
+                  <div className="mt-3 bg-orange-50 border border-orange-200 text-orange-700 text-sm rounded-md p-3 space-y-1">
+                    {detailServiceSummary.alerts.map((msg, idx) => (
+                      <div key={idx} className="flex items-start gap-2">
+                        <AlertCircle className="h-4 w-4 mt-0.5" />
+                        <span>{msg}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3 text-sm text-gray-600">
+                  <div className="border rounded-lg p-3">
+                    <p className="text-xs uppercase text-gray-500 flex items-center gap-1"><Zap className="h-3 w-3" /> Điện</p>
+                    <p className="mt-1">Chỉ số: {detailServiceSummary.electricity.prev ?? "—"} → {detailServiceSummary.electricity.current ?? "—"}</p>
+                    <p>Tiêu thụ: {detailServiceSummary.electricity.consumption != null ? `${detailServiceSummary.electricity.consumption} kWh` : "—"}</p>
+                    <p>Đơn giá: {currency(detailServiceSummary.electricity.rate)}/kWh</p>
+                    <p className="font-semibold text-gray-800 mt-1">{currency(detailServiceSummary.electricity.amount)}</p>
+                  </div>
+                  <div className="border rounded-lg p-3">
+                    <p className="text-xs uppercase text-gray-500 flex items-center gap-1"><Droplet className="h-3 w-3" /> Nước</p>
+                    <p className="mt-1">Chỉ số: {detailServiceSummary.water.prev ?? "—"} → {detailServiceSummary.water.current ?? "—"}</p>
+                    <p>Tiêu thụ: {detailServiceSummary.water.consumption != null ? `${detailServiceSummary.water.consumption} m³` : "—"}</p>
+                    <p>Đơn giá: {currency(detailServiceSummary.water.rate)}/m³</p>
+                    <p className="font-semibold text-gray-800 mt-1">{currency(detailServiceSummary.water.amount)}</p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-3 text-sm text-gray-600">
+                  <div className="border rounded-lg p-3">
+                    <p className="text-xs uppercase text-gray-500">Wifi</p>
+                    <p>Thiết bị: {detailServiceSummary.wifi.devices}</p>
+                    <p className="font-semibold text-gray-800 mt-1">{currency(detailServiceSummary.wifi.amount)}</p>
+                  </div>
+                  <div className="border rounded-lg p-3">
+                    <p className="text-xs uppercase text-gray-500">Phí rác</p>
+                    <p>{detailServiceSummary.trash.included ? "Đang tính" : "Không áp dụng"}</p>
+                    <p className="font-semibold text-gray-800 mt-1">{currency(detailServiceSummary.trash.amount)}</p>
+                  </div>
+                  <div className="border rounded-lg p-3">
+                    <p className="text-xs uppercase text-gray-500">An ninh</p>
+                    <p>Nhân khẩu: {detailServiceSummary.security.occupants}</p>
+                    <p className="font-semibold text-gray-800 mt-1">{currency(detailServiceSummary.security.amount)}</p>
+                  </div>
+                </div>
+                <div className="mt-3 text-sm text-gray-600 border-t pt-3">
+                  <div className="flex justify-between">
+                    <span>Điều chỉnh khác</span>
+                    <span className="font-medium text-gray-800">{currency(detailServiceSummary.other.amount)}</span>
+                  </div>
+                  {detailServiceSummary.other.note && (
+                    <p className="text-xs text-gray-500 mt-1">Ghi chú: {detailServiceSummary.other.note}</p>
+                  )}
+                  <div className="flex justify-between items-center mt-3 pt-3 border-t">
+                    <span className="text-sm text-gray-600">Tổng cộng</span>
+                    <span className="text-lg font-semibold text-indigo-600">{currency(detailServiceSummary.total)}</span>
+                  </div>
+                </div>
+              </Card>
+            )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Card className="p-4">
@@ -3667,6 +4384,1252 @@ function ContractsView() {
   );
 }
 
+function ServicesView() {
+  const { serviceCatalog, serviceUsage, upsertUsageRecord, ensureMonthRecords, previousMonth, nextMonth } = useServices();
+  const months = useMemo(() => getServiceMonths(serviceUsage), [serviceUsage]);
+  const today = useMemo(() => new Date(), []);
+  const fallbackMonth = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
+
+  const [selectedMonth, setSelectedMonth] = useState(() => (months.length ? months[months.length - 1] : fallbackMonth));
+  const [propertyFilter, setPropertyFilter] = useState("all");
+  const [buildingFilter, setBuildingFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [statsMonthFilter, setStatsMonthFilter] = useState("current");
+  const [onlyIssues, setOnlyIssues] = useState(false);
+  const [pendingEdits, setPendingEdits] = useState({});
+  const [autoSaveStatus, setAutoSaveStatus] = useState("idle");
+  const [activeTab, setActiveTab] = useState("meters");
+
+  const tabs = [
+    {
+      id: "meters",
+      label: "Điện & Nước",
+      description: "Nhập chỉ số điện nước kỳ hiện tại và so sánh với số kỳ trước để rà soát bất thường.",
+    },
+    {
+      id: "services",
+      label: "Dịch vụ",
+      description: "Quản lý các dịch vụ ngoài điện nước và điều chỉnh phát sinh theo từng phòng.",
+    },
+    {
+      id: "summary",
+      label: "Tổng hợp tính tiền",
+      description: "Tổng hợp tiêu thụ và chi phí dịch vụ để chuẩn bị tính tiền.",
+    },
+  ];
+
+  const activeTabConfig = tabs.find((tab) => tab.id === activeTab) || tabs[0];
+
+  const autoSaveTimerRef = useRef(null);
+  const autoSaveStatusTimerRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const propertyOptions = useMemo(
+    () => [
+      { value: "all", label: "Tất cả nhà trọ" },
+      ...propertiesSeed.map((p) => ({ value: String(p.id), label: p.name })),
+    ],
+    []
+  );
+
+  const buildingOptions = useMemo(() => {
+    const uniq = new Set();
+    rooms.forEach((room) => uniq.add(guessBuildingCode(room)));
+    return [{ value: "all", label: "Tất cả tòa/khu" }, ...Array.from(uniq).sort().map((code) => ({ value: code, label: code }))];
+  }, []);
+
+  const statusOptions = useMemo(
+    () => [
+      { value: "all", label: "Tất cả trạng thái" },
+      { value: "ACTIVE", label: "Đang hiệu lực" },
+      { value: "ENDING", label: "Sắp kết thúc" },
+      { value: "DRAFT", label: "Nháp" },
+      { value: "TERMINATED", label: "Đã chấm dứt" },
+    ],
+    []
+  );
+
+  useEffect(() => {
+    if (!months.length) return;
+    if (!selectedMonth) {
+      setSelectedMonth(months[months.length - 1]);
+    }
+  }, [months, selectedMonth]);
+
+  const managedContracts = useMemo(
+    () => contracts.filter((contract) => ["ACTIVE", "ENDING"].includes(contract.status)),
+    []
+  );
+
+  useEffect(() => {
+    if (!selectedMonth || managedContracts.length === 0) return;
+    ensureMonthRecords(selectedMonth, managedContracts);
+  }, [selectedMonth, managedContracts, ensureMonthRecords]);
+
+  const toNumericOrUndefined = useCallback((value, { allowNull = false } = {}) => {
+    if (value === undefined) return undefined;
+    if (value === null || value === "") return allowNull ? null : undefined;
+    const normalized = typeof value === "number" ? value : Number(String(value).replace(/,/g, ".").trim());
+    if (Number.isFinite(normalized)) return normalized;
+    return undefined;
+  }, []);
+
+  const overrideMap = useMemo(() => {
+    if (!Object.keys(pendingEdits).length) return null;
+    const map = {};
+    Object.entries(pendingEdits).forEach(([id, edits]) => {
+      const contractId = Number(id);
+      const entry = { month: selectedMonth };
+      if (edits.electricCurrent !== undefined) {
+        const numeric = toNumericOrUndefined(edits.electricCurrent, { allowNull: true });
+        if (numeric !== undefined) entry.electricCurrent = numeric;
+      }
+      if (edits.waterCurrent !== undefined) {
+        const numeric = toNumericOrUndefined(edits.waterCurrent, { allowNull: true });
+        if (numeric !== undefined) entry.waterCurrent = numeric;
+      }
+      if (edits.wifiDevices !== undefined) {
+        const numeric = toNumericOrUndefined(edits.wifiDevices, { allowNull: true });
+        if (numeric !== undefined) entry.wifiDevices = Math.max(0, numeric ?? 0);
+      }
+      if (edits.trashIncluded !== undefined) {
+        entry.trashIncluded = !!edits.trashIncluded;
+      }
+      if (edits.otherAmount !== undefined) {
+        const numeric = toNumericOrUndefined(edits.otherAmount, { allowNull: true });
+        if (numeric !== undefined) entry.otherAmount = numeric ?? 0;
+      }
+      if (edits.note !== undefined) {
+        entry.note = edits.note;
+      }
+      map[contractId] = entry;
+    });
+    return map;
+  }, [pendingEdits, selectedMonth, toNumericOrUndefined]);
+
+  const statusMeta = {
+    ACTIVE: { color: "green", label: "Đang hiệu lực" },
+    ENDING: { color: "yellow", label: "Sắp kết thúc" },
+    DRAFT: { color: "blue", label: "Nháp" },
+    TERMINATED: { color: "red", label: "Đã chấm dứt" },
+  };
+
+  const aggregateSummaries = useCallback(
+    (items) =>
+      items.reduce(
+        (acc, item) => {
+          const summary = item.summary;
+          if (!summary) return acc;
+          acc.contracts += 1;
+          if (summary.electricity.consumption != null && summary.electricity.consumption > 0) {
+            acc.electricityConsumption += summary.electricity.consumption;
+          }
+          acc.electricityAmount += summary.electricity.amount;
+          if (summary.water.consumption != null && summary.water.consumption > 0) {
+            acc.waterConsumption += summary.water.consumption;
+          }
+          acc.waterAmount += summary.water.amount;
+          acc.wifiDevices += summary.wifi.devices;
+          acc.wifiAmount += summary.wifi.amount;
+          if (summary.trash.included) {
+            acc.trashContracts += 1;
+          }
+          acc.trashAmount += summary.trash.amount;
+          acc.securityPeople += summary.security.occupants;
+          acc.securityAmount += summary.security.amount;
+          acc.otherAmount += summary.other.amount;
+          acc.totalAmount += summary.total;
+          return acc;
+        },
+        {
+          contracts: 0,
+          electricityConsumption: 0,
+          electricityAmount: 0,
+          waterConsumption: 0,
+          waterAmount: 0,
+          wifiDevices: 0,
+          wifiAmount: 0,
+          trashContracts: 0,
+          trashAmount: 0,
+          securityPeople: 0,
+          securityAmount: 0,
+          otherAmount: 0,
+          totalAmount: 0,
+        }
+      ),
+    []
+  );
+
+  const serviceSummariesAll = useMemo(
+    () =>
+      managedContracts.map((contract) => {
+        const room = rooms.find((r) => r.id === contract.roomId) || null;
+        const property = room ? propertiesSeed.find((p) => p.id === room.propertyId) || null : null;
+        const summary = summarizeContractServices(contract, serviceUsage, serviceCatalog, selectedMonth, previousMonth, overrideMap || undefined);
+        return {
+          contract,
+          room,
+          property,
+          building: guessBuildingCode(room),
+          summary,
+        };
+      }),
+    [managedContracts, serviceUsage, serviceCatalog, selectedMonth, previousMonth, overrideMap]
+  );
+
+  const totals = useMemo(() => aggregateSummaries(serviceSummariesAll), [aggregateSummaries, serviceSummariesAll]);
+
+  const filteredSummaries = useMemo(() => {
+    return serviceSummariesAll.filter((item) => {
+      if (!item.summary) return false;
+      if (propertyFilter !== "all" && String(item.property?.id) !== propertyFilter) return false;
+      if (buildingFilter !== "all" && item.building !== buildingFilter) return false;
+      if (statusFilter !== "all" && item.contract.status !== statusFilter) return false;
+      return true;
+    });
+  }, [serviceSummariesAll, propertyFilter, buildingFilter, statusFilter]);
+
+  const statsMonthOptions = useMemo(() => {
+    if (!months.length) return [{ value: "current", label: "Kỳ đang chọn" }];
+    const monthList = months.slice().reverse();
+    return [
+      { value: "current", label: "Kỳ đang chọn" },
+      ...monthList.map((month) => ({ value: month, label: formatBillingMonth(month) })),
+    ];
+  }, [months]);
+
+  const statsMonth = statsMonthFilter === "current" ? selectedMonth : statsMonthFilter;
+
+  const statsSummaries = useMemo(() => {
+    if (!statsMonth) return [];
+    return filteredSummaries
+      .map((item) => {
+        const summary = summarizeContractServices(
+          item.contract,
+          serviceUsage,
+          serviceCatalog,
+          statsMonth,
+          previousMonth,
+          statsMonthFilter === "current" ? overrideMap || undefined : null
+        );
+        return summary ? { ...item, summary } : null;
+      })
+      .filter(Boolean);
+  }, [filteredSummaries, serviceUsage, serviceCatalog, statsMonth, statsMonthFilter, previousMonth, overrideMap]);
+
+  const statsAggregates = useMemo(() => aggregateSummaries(statsSummaries), [aggregateSummaries, statsSummaries]);
+
+  const gridSummaries = useMemo(() => {
+    if (!selectedMonth) return [];
+    return filteredSummaries
+      .map((item) => {
+        const summary = summarizeContractServices(
+          item.contract,
+          serviceUsage,
+          serviceCatalog,
+          selectedMonth,
+          previousMonth,
+          overrideMap || undefined
+        );
+        return summary ? { ...item, summary } : null;
+      })
+      .filter(Boolean);
+  }, [filteredSummaries, serviceUsage, serviceCatalog, selectedMonth, previousMonth, overrideMap]);
+
+  const gridRows = useMemo(() => {
+    return gridSummaries.map((item, index) => {
+      const summary = item.summary;
+      const electricity = summary?.electricity || {};
+      const water = summary?.water || {};
+      const wifi = summary?.wifi || {};
+      const trash = summary?.trash || {};
+      const security = summary?.security || {};
+      const other = summary?.other || {};
+
+      const pending = pendingEdits[item.contract.id] || {};
+
+      const displayElectric = pending.electricCurrent !== undefined ? pending.electricCurrent : electricity.current ?? "";
+      const displayWater = pending.waterCurrent !== undefined ? pending.waterCurrent : water.current ?? "";
+      const displayWifi = pending.wifiDevices !== undefined ? pending.wifiDevices : wifi.devices ?? 0;
+      const displayTrash = pending.trashIncluded !== undefined ? pending.trashIncluded : trash.included ?? false;
+      const displayOther = pending.otherAmount !== undefined ? pending.otherAmount : other.amount ?? 0;
+      const displayNote = pending.note !== undefined ? pending.note : other.note ?? "";
+
+      const alerts = [...(summary?.alerts || [])];
+      if (electricity.prev == null) alerts.push("Chưa có chỉ số điện kỳ trước.");
+      if (water.prev == null) alerts.push("Chưa có chỉ số nước kỳ trước.");
+
+      const hasHardError =
+        (electricity.consumption != null && electricity.consumption < 0) ||
+        (water.consumption != null && water.consumption < 0) ||
+        electricity.prev == null ||
+        water.prev == null;
+
+      const previousConsumption = electricity.previousConsumption;
+      const deltaPercent =
+        previousConsumption && previousConsumption !== 0 && electricity.consumption != null
+          ? Math.round(((electricity.consumption - previousConsumption) / previousConsumption) * 100)
+          : null;
+
+      const electricDeltaLabel = electricity.delta != null
+        ? `${electricity.delta >= 0 ? "+" : ""}${electricity.delta} kWh${
+            deltaPercent != null ? ` (${deltaPercent >= 0 ? "+" : ""}${deltaPercent}%)` : ""
+          }`
+        : "—";
+
+      const electricDeltaClass =
+        deltaPercent != null && deltaPercent >= 100
+          ? "text-amber-600 font-semibold"
+          : deltaPercent != null && deltaPercent <= -30
+            ? "text-green-600 font-semibold"
+            : "text-gray-500";
+
+      const waterPreviousConsumption = water.previousConsumption;
+      const waterDeltaPercent =
+        waterPreviousConsumption && waterPreviousConsumption !== 0 && water.consumption != null
+          ? Math.round(((water.consumption - waterPreviousConsumption) / waterPreviousConsumption) * 100)
+          : null;
+
+      const waterDeltaLabel = water.delta != null
+        ? `${water.delta >= 0 ? "+" : ""}${water.delta} m³${
+            waterDeltaPercent != null ? ` (${waterDeltaPercent >= 0 ? "+" : ""}${waterDeltaPercent}%)` : ""
+          }`
+        : "—";
+
+      const waterDeltaClass =
+        waterDeltaPercent != null && waterDeltaPercent >= 100
+          ? "text-amber-600 font-semibold"
+          : waterDeltaPercent != null && waterDeltaPercent <= -30
+            ? "text-green-600 font-semibold"
+            : "text-gray-500";
+
+      const occupantTooltip = item.contract.dependents?.length
+        ? item.contract.dependents.map((dep) => `${dep.name} · ${dep.relation}`).join("\n")
+        : "Chưa có đồng cư";
+
+      return {
+        contractId: item.contract.id,
+        contract: item.contract,
+        roomName: item.room?.name || "—",
+        propertyName: item.property?.name || "—",
+        building: item.building,
+        status: item.contract.status,
+        statusInfo: statusMeta[item.contract.status] || { color: "gray", label: item.contract.status },
+        electricPrev: electricity.prev,
+        electricConsumption: electricity.consumption,
+        electricAmount: electricity.amount || 0,
+        electricDisplay: displayElectric === null ? "" : displayElectric,
+        waterPrev: water.prev,
+        waterConsumption: water.consumption,
+        waterAmount: water.amount || 0,
+        waterDisplay: displayWater === null ? "" : displayWater,
+        electricDeltaLabel,
+        electricDeltaClass,
+        waterDeltaLabel,
+        waterDeltaClass,
+        occupants: security.occupants || 0,
+        occupantTooltip,
+        wifiDevices: displayWifi,
+        wifiAmount: wifi.amount || 0,
+        trashIncluded: displayTrash,
+        trashAmount: trash.amount || 0,
+        otherAmountDisplay: displayOther,
+        otherAmountNumber: other.amount || 0,
+        noteDisplay: displayNote,
+        securityAmount: security.amount || 0,
+        totalAmount: summary?.total || 0,
+        alerts,
+        hasHardError,
+        hasWarning: !hasHardError && alerts.length > 0,
+        rowIndex: index,
+      };
+    });
+  }, [gridSummaries, pendingEdits, statusMeta]);
+
+  const issueCount = useMemo(() => gridRows.filter((row) => row.alerts.length > 0).length, [gridRows]);
+
+  const visibleRows = useMemo(() => (onlyIssues ? gridRows.filter((row) => row.alerts.length > 0) : gridRows), [gridRows, onlyIssues]);
+  const visibleIssueCount = useMemo(() => visibleRows.filter((row) => row.alerts.length > 0).length, [visibleRows]);
+  const visibleTotals = useMemo(
+    () =>
+      visibleRows.reduce(
+        (acc, row) => {
+          acc.totalAmount += row.totalAmount;
+          acc.electricity += row.electricAmount;
+          acc.water += row.waterAmount;
+          acc.wifi += row.wifiAmount;
+          acc.trash += row.trashAmount;
+          acc.security += row.securityAmount;
+          acc.other += row.otherAmountNumber;
+          return acc;
+        },
+        { totalAmount: 0, electricity: 0, water: 0, wifi: 0, trash: 0, security: 0, other: 0 }
+      ),
+    [visibleRows]
+  );
+
+  const buildPayload = useCallback(
+    (contractId, edits) => {
+      const record = findServiceRecord(serviceUsage, contractId, selectedMonth);
+      const payload = {};
+
+      const electricValue = toNumericOrUndefined(edits.electricCurrent, { allowNull: true });
+      if (electricValue !== undefined) {
+        payload.electricity = { current: electricValue };
+      }
+
+      const waterValue = toNumericOrUndefined(edits.waterCurrent, { allowNull: true });
+      if (waterValue !== undefined) {
+        payload.water = { current: waterValue };
+      }
+
+      const wifiValue = toNumericOrUndefined(edits.wifiDevices, { allowNull: true });
+      if (wifiValue !== undefined) {
+        payload.wifiDevices = Math.max(0, wifiValue ?? 0);
+      }
+
+      if (edits.trashIncluded !== undefined) {
+        payload.trashIncluded = !!edits.trashIncluded;
+      }
+
+      if (edits.otherAmount !== undefined || edits.note !== undefined) {
+        const baseAdj = record?.otherAdjustments || { amount: 0, note: "" };
+        const amountValue = toNumericOrUndefined(edits.otherAmount, { allowNull: true });
+        payload.otherAdjustments = {
+          amount: amountValue !== undefined ? (amountValue ?? 0) : baseAdj.amount ?? 0,
+          note: edits.note !== undefined ? edits.note : baseAdj.note || "",
+        };
+      }
+
+      return payload;
+    },
+    [serviceUsage, selectedMonth, toNumericOrUndefined]
+  );
+
+  const commitPending = useCallback(
+    (edits) => {
+      const entries = Object.entries(edits || {});
+      if (!entries.length) return false;
+      let committed = false;
+      entries.forEach(([id, patch]) => {
+        const payload = buildPayload(Number(id), patch);
+        if (payload && Object.keys(payload).length) {
+          upsertUsageRecord(Number(id), selectedMonth, payload);
+          committed = true;
+        }
+      });
+      return committed;
+    },
+    [buildPayload, selectedMonth, upsertUsageRecord]
+  );
+
+  useEffect(() => {
+    if (!Object.keys(pendingEdits).length) return;
+    if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = setTimeout(() => {
+      setAutoSaveStatus("saving");
+      const committed = commitPending(pendingEdits);
+      if (committed) {
+        setPendingEdits({});
+        setAutoSaveStatus("saved");
+        if (autoSaveStatusTimerRef.current) clearTimeout(autoSaveStatusTimerRef.current);
+        autoSaveStatusTimerRef.current = setTimeout(() => setAutoSaveStatus("idle"), 1500);
+      } else {
+        setAutoSaveStatus("idle");
+      }
+    }, 800);
+    return () => {
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    };
+  }, [pendingEdits, commitPending]);
+
+  useEffect(
+    () => () => {
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+      if (autoSaveStatusTimerRef.current) clearTimeout(autoSaveStatusTimerRef.current);
+    },
+    []
+  );
+
+  const updatePending = useCallback((contractId, patch) => {
+    setPendingEdits((prev) => {
+      const key = String(contractId);
+      const current = prev[key] || {};
+      const merged = { ...current, ...patch };
+      const sanitized = Object.fromEntries(Object.entries(merged).filter(([, value]) => value !== undefined));
+      const next = { ...prev };
+      if (Object.keys(sanitized).length === 0) {
+        delete next[key];
+      } else {
+        next[key] = sanitized;
+      }
+      return next;
+    });
+    setAutoSaveStatus("editing");
+  }, []);
+
+  const handleNumberChange = (contractId, field) => (event) => {
+    const raw = event.target.value;
+    updatePending(contractId, { [field]: raw });
+  };
+
+  const handleCheckboxChange = (contractId) => (event) => {
+    updatePending(contractId, { trashIncluded: event.target.checked });
+  };
+
+  const handleNoteChange = (contractId) => (event) => {
+    updatePending(contractId, { note: event.target.value });
+  };
+
+  const handlePasteOnCell = (field, rowIndex, event) => {
+    if (!visibleRows.length) return;
+    event.preventDefault();
+    const text = event.clipboardData.getData("text/plain");
+    if (!text) return;
+    const values = text
+      .split(/\r?\n/)
+      .map((line) => line.split(/\t|,/)[0]?.trim())
+      .filter((line) => line !== undefined);
+    if (!values.length) return;
+
+    setPendingEdits((prev) => {
+      const next = { ...prev };
+      values.forEach((value, offset) => {
+        const targetRow = visibleRows[rowIndex + offset];
+        if (!targetRow) return;
+        const key = String(targetRow.contractId);
+        const numeric = toNumericOrUndefined(value, { allowNull: true });
+        if (numeric === undefined && value !== "") return;
+        const currentPatch = next[key] ? { ...next[key] } : {};
+        currentPatch[field] = value === "" ? "" : numeric ?? 0;
+        next[key] = currentPatch;
+      });
+      return next;
+    });
+    setAutoSaveStatus("editing");
+  };
+
+  const handleKeyDown = (contractId, rowIndex, field) => (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === ";" && field === "note") {
+      event.preventDefault();
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const currentNote = pendingEdits[contractId]?.note ?? visibleRows[rowIndex]?.noteDisplay ?? "";
+      const nextNote = currentNote ? `${currentNote} ${todayStr}` : todayStr;
+      updatePending(contractId, { note: nextNote });
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") {
+      event.preventDefault();
+      const prevRow = visibleRows[rowIndex - 1];
+      if (!prevRow) return;
+      if (field === "electricCurrent") updatePending(contractId, { electricCurrent: prevRow.electricDisplay });
+      if (field === "waterCurrent") updatePending(contractId, { waterCurrent: prevRow.waterDisplay });
+      if (field === "wifiDevices") updatePending(contractId, { wifiDevices: prevRow.wifiDevices });
+      if (field === "otherAmount") updatePending(contractId, { otherAmount: prevRow.otherAmountDisplay });
+      if (field === "note") updatePending(contractId, { note: prevRow.noteDisplay });
+    }
+  };
+
+  const handlePasteFromExcel = () => {
+    window.alert("Đặt con trỏ vào cột Điện/Nước kỳ này rồi nhấn Ctrl+V để dán danh sách chỉ số từ Excel hoặc Google Sheets.");
+  };
+
+  const handleImportCsvClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    window.alert("Chức năng import CSV sẽ được triển khai cùng API trong giai đoạn tiếp theo.");
+    event.target.value = "";
+  };
+
+  const handleCreateNextMonth = () => {
+    const monthToCreate = selectedMonth ? nextMonth(selectedMonth) : fallbackMonth;
+    if (!monthToCreate) return;
+    ensureMonthRecords(monthToCreate, managedContracts);
+    setSelectedMonth(monthToCreate);
+  };
+
+  const handleSaveMeters = () => {
+    if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    const committed = commitPending(pendingEdits);
+    if (committed) {
+      setPendingEdits({});
+      setAutoSaveStatus("saved");
+      if (autoSaveStatusTimerRef.current) clearTimeout(autoSaveStatusTimerRef.current);
+      autoSaveStatusTimerRef.current = setTimeout(() => setAutoSaveStatus("idle"), 1500);
+    }
+    window.alert(`Đã lưu chỉ số cho ${visibleRows.length} phòng.`);
+  };
+
+  const handleIssueInvoices = () => {
+    if (gridRows.some((row) => row.hasHardError)) {
+      window.alert("Không thể phát hành hóa đơn khi vẫn còn lỗi chỉ số hoặc thiếu kỳ trước.");
+      return;
+    }
+    window.alert(`Giả lập phát hành hóa đơn cho ${gridRows.length} hợp đồng kỳ ${formatBillingMonth(selectedMonth)}.`);
+  };
+
+  const getRecentConsumptions = useCallback(
+    (contract, startMonth, count = 3) => {
+      const history = [];
+      let cursor = startMonth;
+      let steps = 0;
+      while (cursor && steps < count) {
+        const consumption = computeMeterConsumptionValue(contract, serviceUsage, cursor, "electricity", previousMonth);
+        history.unshift({ month: cursor, value: consumption });
+        cursor = previousMonth(cursor);
+        steps += 1;
+      }
+      return history;
+    },
+    [serviceUsage, previousMonth]
+  );
+
+  const statsSummariesWithHistory = useMemo(() => {
+    return statsSummaries.map((item) => {
+      const summary = item.summary;
+      if (!summary) return null;
+      const history = getRecentConsumptions(item.contract, statsMonth, 3);
+      return {
+        contractId: item.contract.id,
+        roomName: item.room?.name || "—",
+        propertyName: item.property?.name || "—",
+        status: item.contract.status,
+        totalAmount: summary.total || 0,
+        alerts: summary.alerts || [],
+        history,
+      };
+    }).filter(Boolean);
+  }, [statsSummaries, statsMonth, getRecentConsumptions]);
+
+  const handleScrollToRow = useCallback((contractId) => {
+    const element = document.getElementById(`meter-row-${contractId}`);
+    if (element) {
+      element.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, []);
+
+  const autoSaveLabel = {
+    idle: "Đã đồng bộ",
+    editing: "Đang nhập...",
+    saving: "Đang lưu...",
+    saved: "Đã lưu tạm",
+  };
+
+  const renderSparkline = (history) => {
+    if (!history.length) return <span className="text-xs text-gray-400">Chưa có</span>;
+    const width = 72;
+    const height = 28;
+    const max = Math.max(...history.map((h) => (h.value ?? 0) > 0 ? h.value : 0), 1);
+    const points = history
+      .map((point, idx) => {
+        const x = history.length > 1 ? (idx / (history.length - 1)) * (width - 4) + 2 : width / 2;
+        const val = point.value ?? 0;
+        const y = height - ((val < 0 ? 0 : val) / max) * (height - 4) - 2;
+        return `${x},${y}`;
+      })
+      .join(" ");
+    return (
+      <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="text-indigo-500">
+        <polyline fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" points={points} />
+      </svg>
+    );
+  };
+
+  const FilterSelectors = () => (
+    <div className="flex flex-wrap items-center gap-4">
+      <div>
+        <Label>Nhà trọ</Label>
+        <select
+          value={propertyFilter}
+          onChange={(e) => setPropertyFilter(e.target.value)}
+          className="mt-1 px-3 py-2 border border-gray-300 rounded-md text-sm"
+        >
+          {propertyOptions.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <Label>Tòa/Khu</Label>
+        <select
+          value={buildingFilter}
+          onChange={(e) => setBuildingFilter(e.target.value)}
+          className="mt-1 px-3 py-2 border border-gray-300 rounded-md text-sm"
+        >
+          {buildingOptions.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <Label>Trạng thái HĐ</Label>
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          className="mt-1 px-3 py-2 border border-gray-300 rounded-md text-sm"
+        >
+          {statusOptions.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-semibold text-gray-800">Dịch vụ & Chỉ số</h2>
+          <p className="text-sm text-gray-600">
+            {activeTabConfig.description}
+            <span className="text-gray-500"> · Kỳ {formatBillingMonth(activeTab === "summary" ? statsMonth : selectedMonth)}</span>
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            value={selectedMonth}
+            onChange={(e) => setSelectedMonth(e.target.value)}
+            className="px-3 py-2 border border-gray-300 rounded-md text-sm"
+          >
+            {months.length === 0 && (
+              <option value={selectedMonth}>{formatBillingMonth(selectedMonth)}</option>
+            )}
+            {months.map((month) => (
+              <option key={month} value={month}>
+                {formatBillingMonth(month)}
+              </option>
+            ))}
+          </select>
+          <Button variant="outline" onClick={handleCreateNextMonth}>
+            Tạo kỳ tiếp theo
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 bg-white border border-indigo-100 rounded-md p-1 shadow-sm">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => setActiveTab(tab.id)}
+            className={`px-4 py-2 text-sm font-semibold rounded-md transition ${
+              activeTab === tab.id ? "bg-indigo-500 text-white shadow" : "text-gray-600 hover:bg-indigo-50"
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {activeTab === "meters" && (
+        <>
+          <Card className="p-0 border border-indigo-100 shadow-sm overflow-hidden">
+            <div className="bg-gray-50 border-b p-4 flex flex-wrap items-center justify-between gap-3">
+              <FilterSelectors />
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="outline" onClick={handlePasteFromExcel} className="flex items-center gap-2">
+                  <ClipboardPaste className="h-4 w-4" /> Paste từ Excel
+                </Button>
+                <Button variant="outline" onClick={handleImportCsvClick} className="flex items-center gap-2">
+                  <FileDown className="h-4 w-4" /> Import CSV
+                </Button>
+                <Button variant="outline" onClick={handleSaveMeters} className="flex items-center gap-2">
+                  <Save className="h-4 w-4" /> Lưu chỉ số
+                </Button>
+                <Button
+                  variant={gridRows.some((row) => row.hasHardError) ? "outline" : "green"}
+                  onClick={handleIssueInvoices}
+                  disabled={gridRows.some((row) => row.hasHardError)}
+                  className="flex items-center gap-2"
+                >
+                  <FileText className="h-4 w-4" /> Phát hành hóa đơn
+                </Button>
+              </div>
+            </div>
+            <input ref={fileInputRef} type="file" accept=".csv" className="hidden" onChange={handleFileChange} />
+            <div className="overflow-auto max-h-[60vh]">
+              <table className="min-w-full text-sm text-gray-700">
+                <thead className="sticky top-0 z-10 bg-white shadow text-xs uppercase text-gray-500">
+                  <tr>
+                    <th rowSpan={2} className="px-3 py-3 text-left align-middle">Tên phòng</th>
+                    <th colSpan={2} className="px-3 py-3 text-center align-middle">Điện (kWh)</th>
+                    <th colSpan={2} className="px-3 py-3 text-center align-middle">Nước (m³)</th>
+                    <th rowSpan={2} className="px-3 py-3 text-left align-middle">Sử dụng &amp; Thành tiền</th>
+                    <th rowSpan={2} className="px-3 py-3 text-left align-middle">Ghi chú</th>
+                    <th rowSpan={2} className="px-3 py-3 text-left align-middle">Cảnh báo</th>
+                  </tr>
+                  <tr>
+                    <th className="px-3 py-2 text-center align-middle font-medium text-gray-500">Chỉ số cũ</th>
+                    <th className="px-3 py-2 text-center align-middle font-medium text-gray-500">Chỉ số mới</th>
+                    <th className="px-3 py-2 text-center align-middle font-medium text-gray-500">Chỉ số cũ</th>
+                    <th className="px-3 py-2 text-center align-middle font-medium text-gray-500">Chỉ số mới</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200">
+                  {visibleRows.length === 0 && (
+                    <tr>
+                      <td colSpan={8} className="px-3 py-6 text-center text-sm text-gray-500">
+                        Không có phòng nào trùng với bộ lọc hiện tại.
+                      </td>
+                    </tr>
+                  )}
+                  {visibleRows.map((row, rowIndex) => {
+                    const rowHighlight = row.hasHardError ? "bg-red-50" : row.alerts.length ? "bg-amber-50/70" : "bg-white";
+                    return (
+                      <tr key={row.contractId} id={`meter-row-${row.contractId}`} className={`${rowHighlight} hover:bg-indigo-50 transition`}>
+                        <td className="px-3 py-3 align-top whitespace-nowrap">
+                          <div className="font-semibold text-gray-800">{row.roomName}</div>
+                          <div className="text-xs text-gray-500">{row.propertyName}</div>
+                          <div className="mt-2 flex items-center gap-2 text-xs text-gray-500">
+                            <Badge color={row.statusInfo.color}>{row.statusInfo.label}</Badge>
+                            <span title={row.occupantTooltip}>{row.occupants} người</span>
+                          </div>
+                        </td>
+                        <td className="px-3 py-3 align-top">
+                          <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-right text-sm text-gray-700">
+                            {row.electricPrev != null ? row.electricPrev : "—"}
+                          </div>
+                        </td>
+                        <td className="px-3 py-3 align-top">
+                          <Input
+                            type="number"
+                            value={row.electricDisplay === null ? "" : row.electricDisplay}
+                            onChange={handleNumberChange(row.contractId, "electricCurrent")}
+                            onPaste={(event) => handlePasteOnCell("electricCurrent", rowIndex, event)}
+                            onKeyDown={handleKeyDown(row.contractId, rowIndex, "electricCurrent")}
+                            className="text-right"
+                          />
+                        </td>
+                        <td className="px-3 py-3 align-top">
+                          <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-right text-sm text-gray-700">
+                            {row.waterPrev != null ? row.waterPrev : "—"}
+                          </div>
+                        </td>
+                        <td className="px-3 py-3 align-top">
+                          <Input
+                            type="number"
+                            value={row.waterDisplay === null ? "" : row.waterDisplay}
+                            onChange={handleNumberChange(row.contractId, "waterCurrent")}
+                            onPaste={(event) => handlePasteOnCell("waterCurrent", rowIndex, event)}
+                            onKeyDown={handleKeyDown(row.contractId, rowIndex, "waterCurrent")}
+                            className="text-right"
+                          />
+                        </td>
+                        <td className="px-3 py-3 align-top">
+                          <div className="space-y-3 text-sm text-gray-600">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex items-center gap-2">
+                                <Zap className="h-4 w-4 text-indigo-500" />
+                                <div>
+                                  <p className="text-xs uppercase text-gray-500">Điện</p>
+                                  <p className={`text-sm font-semibold ${
+                                    row.electricConsumption != null && row.electricConsumption < 0 ? "text-red-600" : "text-gray-800"
+                                  }`}>
+                                    {row.electricConsumption != null ? `${row.electricConsumption} kWh` : "—"}
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="text-right">
+                                <p className="text-xs text-gray-500">{currency(row.electricAmount)}</p>
+                                <p className={`text-xs ${row.electricDeltaClass}`}>{row.electricDeltaLabel}</p>
+                              </div>
+                            </div>
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex items-center gap-2">
+                                <Droplet className="h-4 w-4 text-sky-500" />
+                                <div>
+                                  <p className="text-xs uppercase text-gray-500">Nước</p>
+                                  <p className={`text-sm font-semibold ${
+                                    row.waterConsumption != null && row.waterConsumption < 0 ? "text-red-600" : "text-gray-800"
+                                  }`}>
+                                    {row.waterConsumption != null ? `${row.waterConsumption} m³` : "—"}
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="text-right">
+                                <p className="text-xs text-gray-500">{currency(row.waterAmount)}</p>
+                                <p className={`text-xs ${row.waterDeltaClass}`}>{row.waterDeltaLabel}</p>
+                              </div>
+                            </div>
+                            <div className="text-right">
+                              <p className="text-xs uppercase text-gray-500">Tổng cộng</p>
+                              <p className="text-lg font-semibold text-amber-600">{currency(row.totalAmount)}</p>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-3 py-3 align-top">
+                          <input
+                            type="text"
+                            value={row.noteDisplay}
+                            onChange={handleNoteChange(row.contractId)}
+                            onKeyDown={handleKeyDown(row.contractId, rowIndex, "note")}
+                            className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                            placeholder="Ghi chú nhanh"
+                          />
+                        </td>
+                        <td className="px-3 py-3 align-top">
+                          {row.alerts.length === 0 ? (
+                            <span className="text-xs text-gray-400">—</span>
+                          ) : (
+                            <div className="flex items-center gap-1 text-amber-600" title={row.alerts.join("\n")}>
+                              <AlertTriangle className="h-4 w-4" />
+                              <span className="text-xs font-medium">{row.alerts.length} cảnh báo</span>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="sticky bottom-0 bg-white border-t px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-sm">
+              <div className="flex flex-wrap items-center gap-4 text-gray-700">
+                <span>
+                  Điện: <strong className="text-indigo-600">{currency(visibleTotals.electricity || 0)}</strong>
+                </span>
+                <span>
+                  Nước: <strong className="text-indigo-600">{currency(visibleTotals.water || 0)}</strong>
+                </span>
+                <span>
+                  Tổng: <strong className="text-indigo-600">{currency(visibleTotals.totalAmount)}</strong>
+                </span>
+                <span>{visibleRows.length} phòng</span>
+                <span>{visibleIssueCount} cảnh báo</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2 text-sm text-gray-600">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 text-indigo-600 rounded border-gray-300"
+                    checked={onlyIssues}
+                    onChange={(e) => setOnlyIssues(e.target.checked)}
+                  />
+                  Chỉ hiển thị lỗi
+                </label>
+                <span
+                  className={`text-xs ${
+                    autoSaveStatus === "saving"
+                      ? "text-amber-600"
+                      : autoSaveStatus === "saved"
+                        ? "text-green-600"
+                        : autoSaveStatus === "editing"
+                          ? "text-sky-600"
+                          : "text-gray-500"
+                  }`}
+                >
+                  {autoSaveLabel[autoSaveStatus]}
+                </span>
+              </div>
+            </div>
+          </Card>
+        </>
+      )}
+
+      {activeTab === "services" && (
+        <>
+          <Card className="p-0 border border-indigo-100 shadow-sm overflow-hidden">
+            <div className="bg-gray-50 border-b p-4 flex flex-wrap items-center justify-between gap-3">
+              <FilterSelectors />
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="outline" onClick={handleSaveMeters} className="flex items-center gap-2">
+                  <Save className="h-4 w-4" /> Lưu điều chỉnh
+                </Button>
+                <Button
+                  variant={gridRows.some((row) => row.hasHardError) ? "outline" : "green"}
+                  onClick={handleIssueInvoices}
+                  disabled={gridRows.some((row) => row.hasHardError)}
+                  className="flex items-center gap-2"
+                >
+                  <FileText className="h-4 w-4" /> Phát hành hóa đơn
+                </Button>
+              </div>
+            </div>
+            <div className="overflow-auto max-h-[60vh]">
+              <table className="min-w-full text-sm text-gray-700">
+                <thead className="sticky top-0 z-10 bg-white shadow text-xs uppercase text-gray-500">
+                  <tr>
+                    <th className="px-3 py-2 align-middle text-left">Phòng</th>
+                    <th className="px-3 py-2 align-middle text-center">Thiết bị Wifi</th>
+                    <th className="px-3 py-2 align-middle text-right">Tiền Wifi</th>
+                    <th className="px-3 py-2 align-middle text-center">Rác</th>
+                    <th className="px-3 py-2 align-middle text-right">Tiền Rác</th>
+                    <th className="px-3 py-2 align-middle text-right">An ninh</th>
+                    <th className="px-3 py-2 align-middle text-right">Phát sinh ±</th>
+                    <th className="px-3 py-2 align-middle">Ghi chú</th>
+                    <th className="px-3 py-2 align-middle text-right">Thành tiền</th>
+                    <th className="px-3 py-2 align-middle">Cảnh báo</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200">
+                  {visibleRows.length === 0 && (
+                    <tr>
+                      <td colSpan={10} className="px-3 py-6 text-center text-sm text-gray-500">
+                        Không có phòng nào trùng với bộ lọc hiện tại.
+                      </td>
+                    </tr>
+                  )}
+                  {visibleRows.map((row, rowIndex) => {
+                    const rowHighlight = row.hasHardError ? "bg-red-50" : row.alerts.length ? "bg-amber-50/70" : "bg-white";
+                    return (
+                      <tr key={`service-${row.contractId}`} className={`${rowHighlight} hover:bg-indigo-50 transition`}>
+                        <td className="px-3 py-2 align-top whitespace-nowrap">
+                          <div className="font-semibold text-gray-800">{row.roomName}</div>
+                          <div className="text-xs text-gray-500">{row.propertyName}</div>
+                          <div className="mt-1 flex items-center gap-2 text-xs text-gray-500">
+                            <Badge color={row.statusInfo.color}>{row.statusInfo.label}</Badge>
+                            <span title={row.occupantTooltip}>{row.occupants} người</span>
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 align-top text-center">
+                          <Input
+                            type="number"
+                            min={0}
+                            value={row.wifiDevices}
+                            onChange={handleNumberChange(row.contractId, "wifiDevices")}
+                            onKeyDown={handleKeyDown(row.contractId, rowIndex, "wifiDevices")}
+                            className="text-right"
+                          />
+                        </td>
+                        <td className="px-3 py-2 align-top text-right text-gray-800 font-medium">
+                          {currency(row.wifiAmount)}
+                        </td>
+                        <td className="px-3 py-2 align-top text-center">
+                          <input
+                            type="checkbox"
+                            className="h-4 w-4 text-indigo-600 rounded border-gray-300"
+                            checked={row.trashIncluded}
+                            onChange={handleCheckboxChange(row.contractId)}
+                          />
+                        </td>
+                        <td className="px-3 py-2 align-top text-right text-gray-800 font-medium">
+                          {currency(row.trashAmount)}
+                        </td>
+                        <td className="px-3 py-2 align-top text-right text-gray-800 font-medium">
+                          {currency(row.securityAmount)}
+                        </td>
+                        <td className="px-3 py-2 align-top">
+                          <Input
+                            type="number"
+                            value={row.otherAmountDisplay}
+                            step="10000"
+                            onChange={handleNumberChange(row.contractId, "otherAmount")}
+                            onKeyDown={handleKeyDown(row.contractId, rowIndex, "otherAmount")}
+                            className="text-right"
+                          />
+                        </td>
+                        <td className="px-3 py-2 align-top">
+                          <input
+                            type="text"
+                            value={row.noteDisplay}
+                            onChange={handleNoteChange(row.contractId)}
+                            onKeyDown={handleKeyDown(row.contractId, rowIndex, "note")}
+                            className="w-full border border-gray-300 rounded-md px-3 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                            placeholder="Ghi chú dịch vụ"
+                          />
+                        </td>
+                        <td className="px-3 py-2 align-top text-right font-semibold text-gray-800">
+                          {currency(row.totalAmount)}
+                        </td>
+                        <td className="px-3 py-2 align-top">
+                          {row.alerts.length === 0 ? (
+                            <span className="text-xs text-gray-400">—</span>
+                          ) : (
+                            <div className="flex items-center gap-1 text-amber-600" title={row.alerts.join("\n")}>
+                              <AlertTriangle className="h-4 w-4" />
+                              <span className="text-xs font-medium">{row.alerts.length} cảnh báo</span>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="sticky bottom-0 bg-white border-t px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-sm">
+              <div className="flex flex-wrap items-center gap-4 text-gray-700">
+                <span>
+                  Wifi: <strong className="text-indigo-600">{currency(visibleTotals.wifi || 0)}</strong>
+                </span>
+                <span>
+                  Rác: <strong className="text-indigo-600">{currency(visibleTotals.trash || 0)}</strong>
+                </span>
+                <span>
+                  An ninh: <strong className="text-indigo-600">{currency(visibleTotals.security || 0)}</strong>
+                </span>
+                <span>
+                  Khác: <strong className="text-indigo-600">{currency(visibleTotals.other || 0)}</strong>
+                </span>
+                <span>
+                  Tổng: <strong className="text-indigo-600">{currency(visibleTotals.totalAmount)}</strong>
+                </span>
+                <span>{visibleRows.length} phòng</span>
+                <span>{visibleIssueCount} cảnh báo</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2 text-sm text-gray-600">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 text-indigo-600 rounded border-gray-300"
+                    checked={onlyIssues}
+                    onChange={(e) => setOnlyIssues(e.target.checked)}
+                  />
+                  Chỉ hiển thị lỗi
+                </label>
+                <span
+                  className={`text-xs ${
+                    autoSaveStatus === "saving"
+                      ? "text-amber-600"
+                      : autoSaveStatus === "saved"
+                        ? "text-green-600"
+                        : autoSaveStatus === "editing"
+                          ? "text-sky-600"
+                          : "text-gray-500"
+                  }`}
+                >
+                  {autoSaveLabel[autoSaveStatus]}
+                </span>
+              </div>
+            </div>
+          </Card>
+        </>
+      )}
+
+      {activeTab === "summary" && (
+        <>
+          <Card className="p-5 space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-800">Tổng hợp chi phí dịch vụ</h3>
+                <p className="text-sm text-gray-600">
+                  Kỳ {formatBillingMonth(selectedMonth)} · {totals.contracts} hợp đồng đang theo dõi.
+                </p>
+              </div>
+            </div>
+            {serviceSummariesAll.length === 0 ? (
+              <p className="text-sm text-gray-500">Chưa có hợp đồng cần quản lý dịch vụ.</p>
+            ) : (
+              <div className="grid grid-cols-2 lg:grid-cols-6 gap-4 text-sm text-gray-600">
+                <div>
+                  <p className="text-xs uppercase text-gray-500">Điện</p>
+                  <p className="text-lg font-semibold text-gray-800">{currency(totals.electricityAmount)}</p>
+                </div>
+                <div>
+                  <p className="text-xs uppercase text-gray-500">Nước</p>
+                  <p className="text-lg font-semibold text-gray-800">{currency(totals.waterAmount)}</p>
+                </div>
+                <div>
+                  <p className="text-xs uppercase text-gray-500">Wifi</p>
+                  <p className="text-lg font-semibold text-gray-800">{currency(totals.wifiAmount)}</p>
+                </div>
+                <div>
+                  <p className="text-xs uppercase text-gray-500">Rác</p>
+                  <p className="text-lg font-semibold text-gray-800">{currency(totals.trashAmount)}</p>
+                </div>
+                <div>
+                  <p className="text-xs uppercase text-gray-500">An ninh</p>
+                  <p className="text-lg font-semibold text-gray-800">{currency(totals.securityAmount)}</p>
+                </div>
+                <div>
+                  <p className="text-xs uppercase text-gray-500">Khác</p>
+                  <p className="text-lg font-semibold text-gray-800">{currency(totals.otherAmount)}</p>
+                </div>
+                <div className="lg:col-span-6 border-t pt-3">
+                  <p className="text-xs uppercase text-gray-500">Tổng cộng</p>
+                  <p className="text-2xl font-semibold text-indigo-600">{currency(totals.totalAmount)}</p>
+                </div>
+              </div>
+            )}
+          </Card>
+
+          <Card className="p-6 space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
+                  <BarChart3 className="h-5 w-5 text-indigo-500" /> Bảng tổng hợp dịch vụ
+                </h3>
+                <p className="text-sm text-gray-600">
+                  {[
+                    propertyFilter !== "all" ? propertyOptions.find((opt) => opt.value === propertyFilter)?.label : "Tất cả nhà trọ",
+                    buildingFilter !== "all" ? `Tòa/Khu ${buildingFilter}` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+              </div>
+              <div className="flex items-center gap-2 text-sm text-gray-600">
+                <Label className="uppercase text-xs text-gray-500">Kỳ tổng hợp</Label>
+                <select
+                  value={statsMonthFilter}
+                  onChange={(e) => setStatsMonthFilter(e.target.value)}
+                  className="px-3 py-2 border border-gray-300 rounded-md text-sm"
+                >
+                  {statsMonthOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="overflow-auto">
+              <table className="min-w-full text-sm text-gray-700">
+                <thead className="bg-gray-50 text-xs uppercase text-gray-500">
+                  <tr>
+                    <th className="px-3 py-2 text-left">Phòng</th>
+                    <th className="px-3 py-2 text-right">Tổng dịch vụ</th>
+                    <th className="px-3 py-2 text-center">Cảnh báo</th>
+                    <th className="px-3 py-2 text-center">Xu hướng 3 kỳ</th>
+                    <th className="px-3 py-2 text-right">Hành động</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200">
+                  {statsSummariesWithHistory.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="px-3 py-6 text-center text-sm text-gray-500">
+                        Chưa có dữ liệu tổng hợp.
+                      </td>
+                    </tr>
+                  ) : (
+                    statsSummariesWithHistory.map((item) => (
+                      <tr key={`summary-${item.contractId}`} className="hover:bg-indigo-50 transition">
+                        <td className="px-3 py-2">
+                          <div className="font-medium text-gray-800">{item.roomName}</div>
+                          <div className="text-xs text-gray-500">{item.propertyName}</div>
+                        </td>
+                        <td className="px-3 py-2 text-right font-semibold text-gray-800">{currency(item.totalAmount)}</td>
+                        <td className="px-3 py-2 text-center">
+                          {item.alerts.length ? (
+                            <span className="inline-flex items-center gap-1 text-amber-600 text-xs" title={item.alerts.join("\n")}>
+                              <AlertTriangle className="h-4 w-4" /> {item.alerts.length}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-gray-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-center">{renderSparkline(item.history)}</td>
+                        <td className="px-3 py-2 text-right">
+                          <Button variant="outline" onClick={() => handleScrollToRow(item.contractId)}>
+                            Xem dòng
+                          </Button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
+    </div>
+  );
+}
+
 function FinanceView() {
   const rows = invoices.map((inv) => {
     const room = rooms.find((r) => r.id === inv.roomId);
@@ -3801,6 +5764,17 @@ function ResidenceView() {
 // ===== Settings (action log) =====
 function SettingsView() {
   const { logs, clearLogs } = useActionLog();
+  const { serviceCatalog, addService, updateService, removeService } = useServices();
+  const [newService, setNewService] = useState({ name: "", unitPrice: "", method: "per-room" });
+
+  const methodOptions = [
+    { value: "per-room", label: "Theo phòng", hint: "Thu một mức cố định cho mỗi phòng." },
+    { value: "per-person", label: "Theo đầu người", hint: "Nhân với số người đang cư trú." },
+    { value: "meter", label: "Theo chỉ số điện, nước", hint: "Nhân với sản lượng tiêu thụ từng kỳ." },
+  ];
+
+  const methodLabel = (value) => methodOptions.find((opt) => opt.value === value)?.label || value;
+
   const typeLabels = {
     "property:create": { label: "Nhà trọ - Thêm", badge: "green" },
     "property:update": { label: "Nhà trọ - Cập nhật", badge: "blue" },
@@ -3827,54 +5801,182 @@ function SettingsView() {
       second: "2-digit",
     });
 
-  return (
-    <Card className="p-6 space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h3 className="text-xl font-semibold">Cài đặt & Nhật ký thao tác</h3>
-          <p className="text-sm text-gray-600">Theo dõi toàn bộ hành động trên hệ thống và xóa nhật ký khi cần.</p>
-        </div>
-        <Button variant="outline" onClick={clearLogs} disabled={logs.length === 0}>
-          Xóa nhật ký
-        </Button>
-      </div>
+  const handleAddService = () => {
+    if (!newService.name.trim()) return;
+    addService({
+      name: newService.name,
+      unitPrice: Number(newService.unitPrice) || 0,
+      method: newService.method,
+    });
+    setNewService({ name: "", unitPrice: "", method: "per-room" });
+  };
 
-      <div className="border-t pt-4">
-        {logs.length === 0 ? (
-          <p className="text-sm text-gray-500">Chưa có thao tác nào được ghi nhận.</p>
-        ) : (
-          <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
-            {logs.map((log) => {
-              const info = typeLabels[log.type] || { label: log.type, badge: "gray" };
-              const metaEntries = Object.entries(log.meta || {});
-              return (
-                <div key={log.id} className="border border-gray-200 rounded-lg p-4 bg-white shadow-sm">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2">
-                        <Badge color={info.badge}>{info.label}</Badge>
-                        <span className="text-xs text-gray-500">{formatTimestamp(log.timestamp)}</span>
-                      </div>
-                      <p className="text-sm text-gray-800 font-medium">{log.message}</p>
-                    </div>
-                  </div>
-                  {metaEntries.length > 0 && (
-                    <ul className="mt-2 text-xs text-gray-600 space-y-1">
-                      {metaEntries.map(([key, value]) => (
-                        <li key={key}>
-                          <span className="uppercase text-gray-400 mr-1">{key}:</span>
-                          <span>{value}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              );
-            })}
+  const handleUpdateService = (id, patch) => {
+    updateService(id, patch);
+  };
+
+  return (
+    <div className="space-y-6">
+      <Card className="p-6 space-y-4">
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+          <div>
+            <h3 className="text-xl font-semibold">Cấu hình dịch vụ chung</h3>
+            <p className="text-sm text-gray-600">Thiết lập danh mục dịch vụ để áp dụng thống nhất cho việc tính hóa đơn hàng tháng.</p>
           </div>
-        )}
-      </div>
-    </Card>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm text-left text-gray-600">
+            <thead className="text-xs text-gray-700 uppercase bg-gray-50">
+              <tr>
+                <th className="px-4 py-3">Tên dịch vụ</th>
+                <th className="px-4 py-3">Cách tính</th>
+                <th className="px-4 py-3">Đơn giá</th>
+                <th className="px-4 py-3">Ghi chú</th>
+                <th className="px-4 py-3 text-right">Hành động</th>
+              </tr>
+            </thead>
+            <tbody>
+              {serviceCatalog.map((service) => (
+                <tr key={service.id} className="bg-white border-b">
+                  <td className="px-4 py-3">
+                    <Input
+                      value={service.name}
+                      onChange={(e) => handleUpdateService(service.id, { name: e.target.value })}
+                      disabled={service.locked}
+                    />
+                  </td>
+                  <td className="px-4 py-3">
+                    <select
+                      className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                      value={service.method}
+                      onChange={(e) => handleUpdateService(service.id, { method: e.target.value })}
+                      disabled={service.locked && service.method === "meter"}
+                    >
+                      {methodOptions.map((opt) => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">{methodOptions.find((opt) => opt.value === service.method)?.hint}</p>
+                  </td>
+                  <td className="px-4 py-3">
+                    <Input
+                      type="number"
+                      min="0"
+                      step="1000"
+                      value={service.unitPrice ?? 0}
+                      onChange={(e) => handleUpdateService(service.id, { unitPrice: Number(e.target.value) || 0 })}
+                    />
+                  </td>
+                  <td className="px-4 py-3 text-sm text-gray-500">
+                    {service.locked ? "Dịch vụ mặc định, không thể xóa." : "Có thể xóa khi không còn sử dụng."}
+                  </td>
+                  <td className="px-4 py-3 text-right">
+                    <Button
+                      variant="danger"
+                      onClick={() => removeService(service.id)}
+                      disabled={service.locked}
+                    >
+                      <Trash2 className="h-4 w-4 mr-2" /> Xóa
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+              {serviceCatalog.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="px-4 py-6 text-center text-gray-500">Chưa có dịch vụ nào được cấu hình.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="border-t pt-4">
+          <h4 className="text-sm font-semibold text-gray-800 mb-3">Thêm dịch vụ mới</h4>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-sm text-gray-600">
+            <div>
+              <Label>Tên dịch vụ</Label>
+              <Input value={newService.name} onChange={(e) => setNewService((prev) => ({ ...prev, name: e.target.value }))} />
+            </div>
+            <div>
+              <Label>Đơn giá</Label>
+              <Input
+                type="number"
+                min="0"
+                step="1000"
+                value={newService.unitPrice}
+                onChange={(e) => setNewService((prev) => ({ ...prev, unitPrice: e.target.value }))}
+              />
+            </div>
+            <div>
+              <Label>Cách tính</Label>
+              <select
+                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                value={newService.method}
+                onChange={(e) => setNewService((prev) => ({ ...prev, method: e.target.value }))}
+              >
+                {methodOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex items-end">
+              <Button onClick={handleAddService} disabled={!newService.name.trim()}>
+                <Plus className="h-4 w-4 mr-2" /> Thêm dịch vụ
+              </Button>
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-xl font-semibold">Nhật ký thao tác</h3>
+            <p className="text-sm text-gray-600">Theo dõi toàn bộ hành động trên hệ thống và xóa nhật ký khi cần.</p>
+          </div>
+          <Button variant="outline" onClick={clearLogs} disabled={logs.length === 0}>
+            Xóa nhật ký
+          </Button>
+        </div>
+
+        <div className="border-t pt-4">
+          {logs.length === 0 ? (
+            <p className="text-sm text-gray-500">Chưa có thao tác nào được ghi nhận.</p>
+          ) : (
+            <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+              {logs.map((log) => {
+                const info = typeLabels[log.type] || { label: log.type, badge: "gray" };
+                const metaEntries = Object.entries(log.meta || {});
+                return (
+                  <div key={log.id} className="border border-gray-200 rounded-lg p-4 bg-white shadow-sm">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <Badge color={info.badge}>{info.label}</Badge>
+                          <span className="text-xs text-gray-500">{formatTimestamp(log.timestamp)}</span>
+                        </div>
+                        <p className="text-sm text-gray-800 font-medium">{log.message}</p>
+                      </div>
+                    </div>
+                    {metaEntries.length > 0 && (
+                      <ul className="mt-2 text-xs text-gray-600 space-y-1">
+                        {metaEntries.map(([key, value]) => (
+                          <li key={key}>
+                            <span className="uppercase text-gray-400 mr-1">{key}:</span>
+                            <span>{value}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </Card>
+    </div>
   );
 }
 
@@ -3893,6 +5995,7 @@ function Shell() {
     { path: "/properties", label: "Nhà trọ & Phòng", icon: Building2 },
     { path: "/tenants", label: "Quản lý Khách thuê", icon: Users },
     { path: "/contracts", label: "Hợp đồng", icon: FileText },
+    { path: "/services", label: "Dịch vụ & Chỉ số", icon: Zap },
     { path: "/finance", label: "Quản lý Tài chính", icon: DollarSign },
     { path: "/maintenance", label: "Yêu cầu & Sửa chữa", icon: Wrench },
     { path: "/residence", label: "Quản lý Tạm trú", icon: ClipboardList },
@@ -3995,6 +6098,7 @@ function Shell() {
               <Route path="/rooms" element={<Navigate to="/properties" replace />} />
               <Route path="/tenants" element={<TenantsView />} />
               <Route path="/contracts" element={<ContractsView />} />
+              <Route path="/services" element={<ServicesView />} />
               <Route path="/finance" element={<FinanceView />} />
               <Route path="/maintenance" element={<MaintenanceView />} />
               <Route path="/residence" element={<ResidenceView />} />
@@ -4011,9 +6115,11 @@ function Shell() {
 export default function MotelConsoleApp() {
   return (
     <ActionLogProvider>
-      <HashRouter>
-        <Shell />
-      </HashRouter>
+      <ServiceProvider>
+        <HashRouter>
+          <Shell />
+        </HashRouter>
+      </ServiceProvider>
     </ActionLogProvider>
   );
 }
